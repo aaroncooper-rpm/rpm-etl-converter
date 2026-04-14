@@ -77,7 +77,7 @@ def build_validation_data(base, mappings, property_code):
         load_rent_roll, load_lease_details, load_contract_details,
         load_all_residents, load_unit_setup, load_rentable_items,
         load_insurance, load_prospects, load_all_unit, load_birthdays,
-        build_tenant_base, CHARGE_CODE_MAP, STATUS_MAP
+        build_tenant_base, load_former_records, CHARGE_CODE_MAP, STATUS_MAP
     )
 
     rr         = load_rent_roll(base)
@@ -91,6 +91,24 @@ def build_validation_data(base, mappings, property_code):
     all_unit   = load_all_unit(base)
     bdays      = load_birthdays(base)
     tenants    = build_tenant_base(rr, ld_idx, cld, bdays, mappings, property_code)
+    # Load former residents with eviction / balance and merge
+    former_recs = load_former_records(base)
+    # Promote current residents with eviction flag
+    try:
+        import pandas as _pd
+        ld_ev = _pd.read_excel(base + "Lease Details .xlsx", header=8)
+        evict_ids_curr = set(
+            ld_ev[ld_ev["Eviction proceedings started"] == "Yes"]["Household ID/ Resh ID"]
+            .dropna().apply(lambda x: int(float(x)) if str(x).replace(".0","").isdigit() else 0)
+        )
+        for rid, t in tenants.items():
+            if rid in evict_ids_curr and t["status"] == 0:
+                t["status"] = 10
+    except Exception:
+        pass
+    for rid, t in former_recs.items():
+        if rid not in tenants:
+            tenants[rid] = t
 
     t_vals = list(tenants.values())
     curr   = [t for t in t_vals if t["status"] == 0]
@@ -149,7 +167,7 @@ def build_validation_data(base, mappings, property_code):
     # Tenant preview
     tn_rows = []
     for t in sorted(t_vals, key=lambda x: x["unit_code"] or "9999")[:60]:
-        status_label = {0:"🟢 Current",4:"🟡 Notice",6:"🔵 Future"}.get(t["status"],"?")
+        status_label = {0:"🟢 Current",4:"🟡 Notice",6:"🔵 Future",10:"🔴 Eviction",5:"🟠 Former/Bal"}.get(t["status"],"?")
         tn_rows.append({
             "Unit": t["unit_code"], "Tenant Code": t["tenant_code"],
             "Name": f"{t['last_name']}, {t['first_name']}",
@@ -160,9 +178,14 @@ def build_validation_data(base, mappings, property_code):
             "Phone": "✅" if (t["phone1"] or t["phone2"]) else "❌",
         })
 
+    # Eviction and former-with-balance counts
+    eviction_count   = sum(1 for t in tenants.values() if t["status"] == 10)
+    former_bal_count = sum(1 for t in tenants.values() if t["status"] == 5)
+
     return {
         "summary": {
             "current": len(curr), "notice": len(notice), "future": len(future),
+            "eviction": eviction_count, "former_bal": former_bal_count,
             "total_units": len(rr["unit_code"].unique()),
             "garages_assigned": len(assigned), "garages_available": len(available),
             "ri_policies": len(ins_df), "prospects": len(pros_df),
@@ -195,7 +218,9 @@ if "property_code" not in st.session_state:
     st.session_state.property_code = ""
 if "base_dir" not in st.session_state:
     st.session_state.base_dir = None
-if "output_zip" not in st.session_state:
+if "include_former_bal" not in st.session_state:
+    st.session_state.include_former_bal = True   # default: include
+
     st.session_state.output_zip = None
 if "tmp_dirs" not in st.session_state:
     st.session_state.tmp_dirs = []
@@ -247,6 +272,22 @@ if st.session_state.step == 1:
             value=st.session_state.property_code
         )
 
+        st.markdown("")
+        st.markdown("**Past Resident Balances**")
+        bal_choice = st.radio(
+            "Include former residents with an outstanding balance in the ETL files?",
+            options=["Include past resident balances", "Exclude past resident balances"],
+            index=0 if st.session_state.include_former_bal else 1,
+            help=(
+                "**Include** — Former residents who still owe money (non-zero ledger balance) "
+                "will appear in ETL_ResTenants_FormerBal (status 5). "
+                "Recommended for properties with open AR to transfer.\n\n"
+                "**Exclude** — Only current, notice, future, and eviction tenants are exported. "
+                "Use this if past balances will be handled separately."
+            ),
+        )
+        st.session_state.include_former_bal = (bal_choice == "Include past resident balances")
+
         if st.button("⬆ Parse & Validate Mappings", type="primary", disabled=not prop_code.strip()):
             if not prop_code.strip().isdigit():
                 st.error("Property code must be numeric (e.g. 13400)")
@@ -292,6 +333,7 @@ if st.session_state.step == 1:
                         st.session_state.vdata    = vdata
                         st.session_state.property_code = prop_code.strip()
                         st.session_state.base_dir = base
+                        # include_former_bal already stored via radio widget above
                         st.session_state.step     = 2
                         st.rerun()
                     except Exception as e:
@@ -321,6 +363,24 @@ elif st.session_state.step == 2:
         st.caption(f"{m['address']}  ·  {m['city']}, {m['state']} {m['zipcode']}  ·  Prefix: {m['prop_prefix']}")
     with col_run:
         run_clicked = st.button("⚡ Run Conversion", type="primary", use_container_width=True)
+
+    # Past balance filter banner
+    include_former = st.session_state.include_former_bal
+    if include_former:
+        st.info(
+            f"📋 **Past resident balances: Included** — "
+            f"{S['former_bal']} former resident(s) with outstanding balances will be exported "
+            f"in ETL_ResTenants_FormerBal. "
+            f"[Change on upload screen]",
+            icon="✅"
+        )
+    else:
+        st.warning(
+            f"⚠️ **Past resident balances: Excluded** — "
+            f"{S['former_bal']} former resident(s) with outstanding balances will NOT be exported. "
+            f"[Change on upload screen]",
+            icon="🚫"
+        )
     
     if run_clicked:
         if v["unmapped_ut"]:
@@ -331,15 +391,15 @@ elif st.session_state.step == 2:
 
     # ── Metric cards ──────────────────────────────────────────────────────
     c1,c2,c3,c4,c5,c6,c7,c8 = st.columns(8)
-    for col, label, value, delta_color in [
-        (c1, "Current",     S["current"],           "normal"),
-        (c2, "On Notice",   S["notice"],            "inverse"),
-        (c3, "Future",      S["future"],            "normal"),
-        (c4, "Total Units", S["total_units"],        "off"),
-        (c5, "Garages Leased",   S["garages_assigned"],  "normal"),
-        (c6, "Garages Free",     S["garages_available"], "normal"),
-        (c7, "RI Policies",      S["ri_policies"],        "normal"),
-        (c8, "Prospects",        S["prospects"],          "normal"),
+    for col, label, value in [
+        (c1, "Current",            S["current"]),
+        (c2, "On Notice",          S["notice"]),
+        (c3, "Future / Applicant", S["future"]),
+        (c4, "Eviction",           S["eviction"]),
+        (c5, "Former w/ Balance",  S["former_bal"] if include_former else f"~~{S['former_bal']}~~ excl."),
+        (c6, "Total Units",        S["total_units"]),
+        (c7, "RI Policies",        S["ri_policies"]),
+        (c8, "Prospects",          S["prospects"]),
     ]:
         col.metric(label, value)
 
@@ -452,11 +512,18 @@ elif st.session_state.step == 2:
 
     # ─ Output Forecast ────────────────────────────────────────────────────
     with tab_out:
-        st.caption("15 files will be generated from your source data.")
+        st.caption("17 files will be generated from your source data." if include_former else "16 files will be generated (past balance file excluded).")
         FORECAST = [
             ("ETL_ResTenants",            "Current residents (status=0)",              S["current"]),
             ("ETL_ResTenants_Notice",     "On-notice residents (status=4)",             S["notice"]),
             ("ETL_ResTenants_Future",     "Future / applicant residents (status=6)",    S["future"]),
+            ("ETL_ResTenants_Eviction",   "Eviction proceedings (status=10)",           S["eviction"]),
+        ]
+        if include_former:
+            FORECAST.append(
+                ("ETL_ResTenants_FormerBal",  "Former residents with open balance (status=5)", S["former_bal"])
+            )
+        FORECAST += [
             ("ETL_ResRoommates",          "Co-occupants & roommates",                   "—"),
             ("ETL_ResRentableItemsTypes", "Rentable item type definitions",             len(m["rentable_types"]) or 1),
             ("ETL_ResRentableItems",      "Individual rentable items",                  "—"),
@@ -480,6 +547,7 @@ elif st.session_state.step == 2:
             for k in ["step","mappings","vdata","amenity_overrides","property_code","base_dir","output_zip"]:
                 st.session_state[k] = None if k != "step" else 1
                 if k == "amenity_overrides": st.session_state[k] = {}
+            st.session_state.include_former_bal = True
             st.rerun()
     with col_run2:
         if st.button("⚡ Run Conversion", type="primary", use_container_width=True, key="run2"):
@@ -520,7 +588,11 @@ elif st.session_state.step == 3:
             tmp_out = tempfile.mkdtemp()
             st.session_state.tmp_dirs.append(tmp_out)
 
-            generated, zip_path = run_conversion(base, tmp_out, m, pc, progress_cb=cb)
+            generated, zip_path = run_conversion(
+                base, tmp_out, m, pc,
+                progress_cb=cb,
+                include_former_bal=st.session_state.include_former_bal
+            )
 
             pbar.progress(100)
             log_el.code("\n".join(msgs))
@@ -558,6 +630,7 @@ elif st.session_state.step == 3:
                     if k == "step": st.session_state[k] = 1
                     elif k == "amenity_overrides": st.session_state[k] = {}
                     else: st.session_state[k] = None
+                st.session_state.include_former_bal = True
                 st.rerun()
 
         with info_col:

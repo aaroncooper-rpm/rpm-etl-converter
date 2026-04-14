@@ -15,6 +15,105 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 
+
+def load_former_records(base):
+    """
+    Load former residents who must still appear in Yardi:
+      - Eviction proceedings started (any balance)    → status 10
+      - Former resident with non-zero Ledger Balance  → status 5
+    Returns a dict: resh_id → tenant record (same shape as build_tenant_base output)
+    """
+    try:
+        ld = pd.read_excel(_find_file(base, "Lease Details .xlsx"), header=8)
+    except Exception:
+        return {}
+
+    ld["resh_id"] = ld["Household ID/ Resh ID"].apply(lambda x: safe_int(x, 0))
+    ld = ld[ld["resh_id"] > 0]
+
+    former = ld[ld["Occupancy status"].str.contains("Former", case=False, na=False)]
+    former = former.drop_duplicates("resh_id", keep="last")
+
+    eviction_ids = set(
+        ld[ld["Eviction proceedings started"] == "Yes"]["resh_id"].dropna().astype(int)
+    )
+    balance_ids = set(
+        former[former["Ledger Balance"].fillna(0) != 0]["resh_id"].astype(int)
+    )
+
+    include_ids = eviction_ids | balance_ids
+    subset = former[former["resh_id"].isin(include_ids)].copy()
+
+    tenants = {}
+    for _, row in subset.iterrows():
+        resh_id = int(row["resh_id"])
+        if resh_id in tenants:
+            continue
+
+        name_raw = str(row.get("Household name", "")) if pd.notna(row.get("Household name")) else ""
+        last, first, middle = parse_name(name_raw)
+
+        is_eviction = resh_id in eviction_ids
+        status = 10 if is_eviction else 5
+
+        # Parse unit code from "Unit #" column (stored as '0122 style)
+        unit_raw = str(row.get("Unit #", "")) if pd.notna(row.get("Unit #")) else ""
+        unit_code = clean_unit(unit_raw)
+
+        phone1  = clean_phone(row.get("Cell Phone"))
+        phone2  = clean_phone(row.get("Home Phone"))
+        phone3  = clean_phone(row.get("Work Phone"))
+        move_in = fmt_date(row.get("Move-in date"))
+        move_out= fmt_date(row.get("Moved out date"))
+        notice  = fmt_date(row.get("Notice given date"))
+        l_from  = fmt_date(row.get("Lease start date"))
+        l_to    = fmt_date(row.get("Lease end date"))
+        l_sign  = fmt_date(row.get("Lease signed date"))
+        l_term  = extract_term(row.get("Lease term")) or 12
+        balance = float(row.get("Ledger Balance") or 0)
+        l_rent  = safe_int(row.get("Lease Rent"))
+        deposit = safe_int(row.get("Required deposit"))
+
+        # Try to parse address from forwarding/billing
+        address1 = city = state = zipcode = None
+        for af in ("FAS Forwarding address", "Billing address"):
+            addr = row.get(af, "")
+            if pd.notna(addr) and str(addr).strip():
+                import re as _re
+                m = _re.match(r"(.+?)\s*,\s*(.+?)\s*,\s*([A-Z]{2})\s+([\d\-]+)", str(addr))
+                if m:
+                    address1 = m.group(1).strip(); city = m.group(2).strip()
+                    state    = m.group(3).strip(); zipcode = m.group(4).strip()
+                    break
+
+        tenants[resh_id] = {
+            "resh_id":     resh_id,
+            "tenant_code": make_tenant_code(resh_id),
+            "unit_code":   unit_code,
+            "status":      status,
+            "last_name":   last,
+            "first_name":  first,
+            "middle_name": middle or None,
+            "dob":         None,
+            "ssn":         None,
+            "move_in":     move_in,
+            "move_out":    move_out,
+            "notice_date": notice,
+            "lease_from":  l_from,
+            "lease_to":    l_to,
+            "lease_sign":  l_sign,
+            "phone1": phone1, "phone2": phone2, "phone3": phone3, "phone4": None,
+            "email":       None,
+            "address1":    address1, "address2": None,
+            "city": city, "state": state, "zipcode": zipcode,
+            "rent":    l_rent,
+            "deposit": deposit,
+            "lease_term": l_term,
+            "floorplan":  "",
+        }
+    return tenants
+
+
 def _find_file(base: str, name: str) -> str:
     """Find a file by name, falling back from .xls to .xlsx if needed."""
     p = base + name
@@ -261,6 +360,8 @@ STATUS_MAP = {
     "Occupied-NTV":    4,
     "Occupied-NTVL":   4,
     "Applicant":       6,
+    "Vacant-Leased":   6,   # pre-leased vacant unit - future resident
+    # Eviction (10) and Former-with-balance (5) are loaded separately from Lease Details
 }
 
 # ─────────────────────────── DATA LOADERS ────────────────────────────────────
@@ -739,7 +840,7 @@ def gen_unit_amenities(unit_setup_df, mappings, prop_code):
 
 # ─────────────────────────── MAIN RUNNER ─────────────────────────────────────
 
-def run_conversion(base, output_dir, mappings, property_code, progress_cb=None):
+def run_conversion(base, output_dir, mappings, property_code, progress_cb=None, include_former_bal=True):
     """
     Run full conversion.
     base: path ending with '/' containing the OneSite export files
@@ -771,11 +872,38 @@ def run_conversion(base, output_dir, mappings, property_code, progress_cb=None):
     future = sum(1 for t in tenants.values() if t["status"] == 6)
     log(f"   → {curr} current  |  {notice} on notice  |  {future} future")
 
+    log("📋 Loading former residents with balance / eviction...")
+    former_tenants = load_former_records(base)
+    evictions  = sum(1 for t in former_tenants.values() if t["status"] == 10)
+    former_bal = sum(1 for t in former_tenants.values() if t["status"] == 5)
+    # Also flag current residents who have eviction proceedings
+    try:
+        ld_evict = pd.read_excel(_find_file(base, "Lease Details .xlsx"), header=8)
+        evict_ids_curr = set(
+            ld_evict[ld_evict["Eviction proceedings started"] == "Yes"]["Household ID/ Resh ID"]
+            .dropna().apply(lambda x: safe_int(x, 0))
+        )
+        for rid, t in tenants.items():
+            if rid in evict_ids_curr and t["status"] == 0:
+                t["status"] = 10   # promote current resident to eviction
+    except Exception:
+        pass
+    # Merge former records (don't overwrite existing current/notice/future tenants)
+    for rid, t in former_tenants.items():
+        if rid not in tenants:
+            tenants[rid] = t
+    log(f"   → {evictions} evictions  |  {former_bal} former with balance")
+
     prop_code = property_code
     outputs = [
-        ("ETL_ResTenants",            *gen_tenants(tenants, 0, prop_code)),
-        ("ETL_ResTenants_Notice",     *gen_tenants(tenants, 4, prop_code)),
-        ("ETL_ResTenants_Future",     *gen_tenants(tenants, 6, prop_code)),
+        ("ETL_ResTenants",             *gen_tenants(tenants, 0, prop_code)),
+        ("ETL_ResTenants_Eviction",    *gen_tenants(tenants, 10, prop_code)),
+        ("ETL_ResTenants_Notice",      *gen_tenants(tenants, 4, prop_code)),
+        ("ETL_ResTenants_Future",      *gen_tenants(tenants, 6, prop_code)),
+    ]
+    if include_former_bal:
+        outputs.append(("ETL_ResTenants_FormerBal", *gen_tenants(tenants, 5, prop_code)))
+    outputs += [
         ("ETL_ResRoommates",          *gen_roommates(all_res, tenants, prop_code)),
         ("ETL_ResRentableItemsTypes", *gen_rentable_item_types(mappings, prop_code)),
         ("ETL_ResRentableItems",      *gen_rentable_items(rent_items, mappings, prop_code)),
