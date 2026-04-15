@@ -588,8 +588,18 @@ def t_row(t, prop_code):
             t["address1"], t["address2"], t["city"], t["state"], t["zipcode"],
             t["rent"], t["deposit"], t["lease_term"]]
 
-def gen_tenants(tenants, status_filter, prop_code):
-    return TENANT_COLS, [t_row(t, prop_code) for t in tenants.values() if t["status"] == status_filter]
+def gen_tenants(tenants, status_filter, prop_code, include_tcode=False):
+    """include_tcode=False → Tenant_Code column is blank (Phase 1)."""
+    rows = []
+    for t in tenants.values():
+        if t["status"] != status_filter:
+            continue
+        row = t_row(t, prop_code)
+        if not include_tcode:
+            row[1] = None   # blank Tenant_Code (index 1 in TENANT_COLS)
+        rows.append(row)
+    return TENANT_COLS, rows
+
 
 def gen_roommates(all_res, tenants, prop_code):
     cols = ["Tenant_Code","Roommate_PhoneNumber1","Roommate_PhoneNumber2",
@@ -840,6 +850,65 @@ def gen_unit_amenities(unit_setup_df, mappings, prop_code):
 
 # ─────────────────────────── MAIN RUNNER ─────────────────────────────────────
 
+
+def _apply_tcode(t, tcode_map):
+    """Return the real Yardi tcode for this tenant, or None if not yet mapped."""
+    return tcode_map.get(t["resh_id"]) or tcode_map.get(t["unit_code"])
+
+
+def gen_roommates_p2(all_res, tenants, prop_code, tcode_map):
+    """Phase 2: roommates with real tcodes from Yardi."""
+    tc_to_rid  = {t["tenant_code"]: t["resh_id"] for t in tenants.values()}
+    cols, rows = gen_roommates(all_res, tenants, prop_code)
+    for row in rows:
+        rid    = tc_to_rid.get(row[0])
+        row[0] = tcode_map.get(rid) or row[0]
+    return cols, rows
+
+
+def gen_ri_policies_p2(ins_df, tenants, prop_code, tcode_map):
+    """Phase 2: RI policies with real tcodes."""
+    # Build reverse map: generated_tcode -> resh_id for lookup
+    tc_to_rid = {t["tenant_code"]: t["resh_id"] for t in tenants.values()}
+    cols, rows = gen_ri_policies(ins_df, tenants, prop_code)
+    for row in rows:
+        rid     = tc_to_rid.get(row[6])
+        real_tc = tcode_map.get(rid) if rid else None
+        row[6]  = real_tc or row[6]
+        row[10] = real_tc or row[10]
+    return cols, rows
+
+
+def gen_lease_charges_p2(rr, tenants, prop_code, tcode_map):
+    """Phase 2: lease charges with real tcodes."""
+    tc_to_rid = {t["tenant_code"]: t["resh_id"] for t in tenants.values()}
+    cols, rows = gen_lease_charges(rr, tenants, prop_code)
+    for row in rows:
+        rid     = tc_to_rid.get(row[1])
+        row[1]  = tcode_map.get(rid) or row[1]
+    return cols, rows
+
+
+def gen_manage_rentable_p2(rent_df, tenants, mappings, prop_code, tcode_map):
+    """Phase 2: rentable item assignments with real tcodes."""
+    tc_to_rid = {t["tenant_code"]: t["resh_id"] for t in tenants.values()}
+    cols, rows = gen_manage_rentable(rent_df, tenants, mappings, prop_code)
+    for row in rows:
+        rid    = tc_to_rid.get(row[1])
+        row[1] = tcode_map.get(rid) or row[1]
+    return cols, rows
+
+
+def gen_leasebut_demo_p2(rr, ld_idx, cld_by_unit, tenants, prop_code, tcode_map):
+    """Phase 2: demo file with real tcodes (demo_tcode column = col index 2)."""
+    cols, rows = gen_leasebut_demo(rr, ld_idx, cld_by_unit, tenants, prop_code)
+    for row in rows:
+        rid     = row[1]   # HCODE = resh_id
+        real_tc = tcode_map.get(rid) or row[2]
+        row[2]  = real_tc
+    return cols, rows
+
+
 def run_conversion(base, output_dir, mappings, property_code, progress_cb=None, include_former_bal=True):
     """
     Run full conversion.
@@ -934,3 +1003,210 @@ def run_conversion(base, output_dir, mappings, property_code, progress_cb=None, 
 
     log(f"\n🎉 Done!  {len(generated)} files  →  {zip_path}")
     return generated, zip_path
+
+
+# ─────────────────── PHASE 1: RESIDENTS + PROPERTY FILES ────────────────────
+
+PHASE1_FILES = {
+    "ETL_ResTenants", "ETL_ResTenants_Notice", "ETL_ResTenants_Future",
+    "ETL_ResTenants_Eviction", "ETL_ResTenants_FormerBal",
+    "ETL_ResRentableItemsTypes", "ETL_ResRentableItems",
+    "ETL_ResUnitTypes", "ETL_CommUnits",
+    "ETL_ResPropertyAmenities", "ETL_ResUnitAmenities", "ETL_ResProspects",
+}
+
+PHASE2_FILES = {
+    "ETL_ResRoommates", "ETL_RIPolicies", "ETL_ResLeaseCharges",
+    "ETL_ResManageRentableItems", "ETL_leasebut_demo",
+}
+
+
+def run_phase1(base, output_dir, mappings, property_code,
+               include_former_bal=True, progress_cb=None):
+    """
+    Phase 1: Generate resident files (Tenant_Code BLANK) + all property files.
+    Returns (generated_files, zip_path, tenants).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    def log(m):
+        if progress_cb: progress_cb(m)
+        else: print(m)
+
+    log("📂 Loading source files...")
+    rr         = load_rent_roll(base)
+    ld_idx     = load_lease_details(base)
+    cld        = load_contract_details(base)
+    all_res    = load_all_residents(base)
+    unit_setup = load_unit_setup(base)
+    rent_items = load_rentable_items(base)
+    insurance  = load_insurance(base)
+    prospects  = load_prospects(base)
+    all_unit   = load_all_unit(base)
+    bdays      = load_birthdays(base)
+
+    log("🔧 Building tenant records...")
+    tenants = build_tenant_base(rr, ld_idx, cld, bdays, mappings, property_code)
+    # Promote evictions + add former-with-balance
+    try:
+        ld_ev = pd.read_excel(_find_file(base, "Lease Details .xlsx"), header=8)
+        evict_ids = set(
+            ld_ev[ld_ev["Eviction proceedings started"] == "Yes"]
+            ["Household ID/ Resh ID"].dropna()
+            .apply(lambda x: safe_int(x, 0))
+        )
+        for rid, t in tenants.items():
+            if rid in evict_ids and t["status"] == 0:
+                t["status"] = 10
+    except Exception:
+        pass
+    former_recs = load_former_records(base)
+    for rid, t in former_recs.items():
+        if rid not in tenants:
+            tenants[rid] = t
+
+    curr   = sum(1 for t in tenants.values() if t["status"] == 0)
+    notice = sum(1 for t in tenants.values() if t["status"] == 4)
+    future = sum(1 for t in tenants.values() if t["status"] == 6)
+    evict  = sum(1 for t in tenants.values() if t["status"] == 10)
+    fbal   = sum(1 for t in tenants.values() if t["status"] == 5)
+    log(f"   → {curr} current | {notice} notice | {future} future | {evict} eviction | {fbal} former/bal")
+
+    prop_code = property_code
+
+    # Resident files — Tenant_Code column is BLANK (include_tcode=False)
+    outputs = [
+        ("ETL_ResTenants",         *gen_tenants(tenants, 0,  prop_code, include_tcode=False)),
+        ("ETL_ResTenants_Notice",  *gen_tenants(tenants, 4,  prop_code, include_tcode=False)),
+        ("ETL_ResTenants_Future",  *gen_tenants(tenants, 6,  prop_code, include_tcode=False)),
+        ("ETL_ResTenants_Eviction",*gen_tenants(tenants, 10, prop_code, include_tcode=False)),
+    ]
+    if include_former_bal:
+        outputs.append(
+            ("ETL_ResTenants_FormerBal", *gen_tenants(tenants, 5, prop_code, include_tcode=False))
+        )
+    # Property files — no tcode needed
+    outputs += [
+        ("ETL_ResRentableItemsTypes", *gen_rentable_item_types(mappings, prop_code)),
+        ("ETL_ResRentableItems",      *gen_rentable_items(rent_items, mappings, prop_code)),
+        ("ETL_ResUnitTypes",          *gen_unit_types(mappings, prop_code)),
+        ("ETL_CommUnits",             *gen_comm_units(all_unit, unit_setup, mappings, prop_code)),
+        ("ETL_ResPropertyAmenities",  *gen_property_amenities(mappings, prop_code)),
+        ("ETL_ResUnitAmenities",      *gen_unit_amenities(unit_setup, mappings, prop_code)),
+        ("ETL_ResProspects",          *gen_prospects(prospects, prop_code, mappings["unit_type_map"])),
+    ]
+
+    ts = datetime.now().strftime("%y%m%d_%H%M%S")
+    generated = []
+    for table_name, cols, rows in outputs:
+        fname = f"{ts}_{table_name}.xlsx"
+        fpath = os.path.join(output_dir, fname)
+        write_etl_xlsx(table_name, cols, rows, fpath)
+        generated.append(fpath)
+        log(f"   ✅ {table_name} → {len(rows)} rows")
+
+    zip_path = os.path.join(output_dir, f"{ts}_Phase1_ETL.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fp in generated:
+            zf.write(fp, os.path.join("Phase1_ETL", os.path.basename(fp)))
+
+    log(f"\n🎉 Phase 1 complete — {len(generated)} files → {zip_path}")
+    return generated, zip_path, tenants
+
+
+# ─────────────────── PHASE 2: TCODE-DEPENDENT FILES ─────────────────────────
+
+def load_tcode_mapping(etl_file_paths, tenants):
+    """
+    Read one or more ETL_ResTenants files exported from Yardi after Phase 1 import.
+    Yardi populates the Tenant_Code column; this builds:
+        resh_id (int) → yardi_tenant_code (str)
+    matching by Unit_Code + Last_Name (handles Yardi writing unit as int, e.g. 117 not '0117').
+
+    Pass a single path or a list of paths — all variant files are merged into one map.
+    ETL format: row 1 = table name, row 2 = column headers, row 3+ = data.
+    """
+    if isinstance(etl_file_paths, (str, bytes, os.PathLike)):
+        etl_file_paths = [etl_file_paths]
+
+    # Build reverse lookup: (zero_padded_unit, last_name_lower) → resh_id
+    key_to_rid = {}
+    for rid, t in tenants.items():
+        uc   = (t.get("unit_code") or "").strip()   # already zero-padded e.g. '0117'
+        last = (t.get("last_name") or "").lower().strip()
+        if uc and last:
+            key_to_rid[(uc, last)] = rid
+
+    tcode_map = {}
+    for path in etl_file_paths:
+        df = pd.read_excel(path, skiprows=1, header=0)
+        for _, row in df.iterrows():
+            # Normalize unit_code: Yardi may return int 117 — zero-pad to '0117'
+            raw = row.get("Unit_Code", "") or ""
+            s   = re.sub(r"['\s#]", "", str(raw))
+            mm  = re.match(r"(\d+)", s)
+            unit = mm.group(1).zfill(4) if mm else s.strip()
+
+            last = str(row.get("Last_Name",   "") or "").strip().lower()
+            tc   = str(row.get("Tenant_Code", "") or "").strip()
+
+            if unit and last and tc and tc.lower() not in ("nan", "none", ""):
+                rid = key_to_rid.get((unit, last))
+                if rid and rid not in tcode_map:   # first match wins
+                    tcode_map[rid] = tc
+
+    return tcode_map
+
+
+
+def run_phase2(base, output_dir, mappings, property_code,
+               tenants, tcode_map, progress_cb=None):
+    """
+    Phase 2: Generate tcode-dependent files using the mapping returned by Yardi.
+    tenants: the tenant dict from Phase 1 (stored in session state).
+    tcode_map: {resh_id → yardi_tenant_code}
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    def log(m):
+        if progress_cb: progress_cb(m)
+        else: print(m)
+
+    matched   = sum(1 for t in tenants.values() if tcode_map.get(t["resh_id"]))
+    unmatched = sum(1 for t in tenants.values() if not tcode_map.get(t["resh_id"]))
+    log(f"🔑 Tcode mapping: {matched} matched, {unmatched} unmatched")
+
+    log("📂 Reloading dependent source files...")
+    rr         = load_rent_roll(base)
+    ld_idx     = load_lease_details(base)
+    cld        = load_contract_details(base)
+    all_res    = load_all_residents(base)
+    rent_items = load_rentable_items(base)
+    insurance  = load_insurance(base)
+
+    prop_code = property_code
+    outputs = [
+        ("ETL_ResRoommates",          *gen_roommates_p2(all_res, tenants, prop_code, tcode_map)),
+        ("ETL_RIPolicies",            *gen_ri_policies_p2(insurance, tenants, prop_code, tcode_map)),
+        ("ETL_ResLeaseCharges",       *gen_lease_charges_p2(rr, tenants, prop_code, tcode_map)),
+        ("ETL_ResManageRentableItems",*gen_manage_rentable_p2(rent_items, tenants, mappings, prop_code, tcode_map)),
+        ("ETL_leasebut_demo",         *gen_leasebut_demo_p2(rr, ld_idx, cld, tenants, prop_code, tcode_map)),
+    ]
+
+    ts = datetime.now().strftime("%y%m%d_%H%M%S")
+    generated = []
+    for table_name, cols, rows in outputs:
+        fname = f"{ts}_{table_name}.xlsx"
+        fpath = os.path.join(output_dir, fname)
+        write_etl_xlsx(table_name, cols, rows, fpath)
+        generated.append(fpath)
+        log(f"   ✅ {table_name} → {len(rows)} rows")
+
+    zip_path = os.path.join(output_dir, f"{ts}_Phase2_ETL.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fp in generated:
+            zf.write(fp, os.path.join("Phase2_ETL", os.path.basename(fp)))
+
+    log(f"\n🎉 Phase 2 complete → {zip_path}")
+    return generated, zip_path
+
