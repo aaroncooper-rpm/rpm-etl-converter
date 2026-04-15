@@ -319,7 +319,7 @@ elif st.session_state.step == 3:
             log_el.code("\n".join(msgs[-16:]))
 
         try:
-            from converter import run_phase1
+            from converter import run_phase1, build_validation_workbook
             tmp_out = tempfile.mkdtemp()
             st.session_state.tmp_dirs.append(tmp_out)
             gen1, zip1, tenants = run_phase1(
@@ -330,6 +330,15 @@ elif st.session_state.step == 3:
             pbar.progress(100); log_el.code("\n".join(msgs))
             with open(zip1,"rb") as f: st.session_state.phase1_zip = f.read()
             st.session_state.tenants = tenants
+
+            # Build validation workbook from vdata already in session
+            cb("📊 Building validation workbook...")
+            val_path = os.path.join(tmp_out, f"{pc}_Validation_Report.xlsx")
+            build_validation_workbook(st.session_state.vdata, m, pc, tenants, val_path)
+            with open(val_path, "rb") as f:
+                st.session_state.validation_xlsx = f.read()
+            cb("   ✅ Validation_Report.xlsx")
+
             st.rerun()
         except Exception as e:
             import traceback
@@ -339,21 +348,38 @@ elif st.session_state.step == 3:
         st.success("Resident and property files generated. Tenant_Code columns are **blank** — Yardi will assign them on import.")
         st.markdown("")
 
-        st.download_button(
-            "⬇ Download Phase 1 ETL Package",
-            data=st.session_state.phase1_zip,
-            file_name=f"{pc}_Phase1_ETL.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            st.markdown("**📦 Phase 1 ETL Files**")
+            st.caption("Resident files (blank Tenant_Code) + all property files — import these into Yardi first")
+            st.download_button(
+                "⬇ Download Phase 1 ETL Package",
+                data=st.session_state.phase1_zip,
+                file_name=f"{pc}_Phase1_ETL.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        with col_dl2:
+            st.markdown("**📊 Validation Report**")
+            st.caption("Full tenant roster, mapping tables, data quality flags, and warnings — review before importing")
+            val_data = st.session_state.get("validation_xlsx")
+            if val_data:
+                st.download_button(
+                    "⬇ Download Validation_Report.xlsx",
+                    data=val_data,
+                    file_name=f"{pc}_Validation_Report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
 
         st.markdown("---")
         st.info(
             "**Next steps:**\n"
-            "1. Import the resident ETL files from the Phase 1 zip into Yardi\n"
-            "2. Yardi assigns a unique Tenant_Code to each resident upon import\n"
-            "3. Export the resident records from Yardi (the file will contain the populated Tenant_Code column)\n"
-            "4. Return here and upload that exported file to generate the Phase 2 files",
+            "1. Review the Validation Report for any issues before importing\n"
+            "2. Import the resident ETL files from the Phase 1 zip into Yardi\n"
+            "3. Yardi assigns a unique Tenant_Code to each resident upon import\n"
+            "4. Export the resident records from Yardi (the file will have the Tenant_Code column populated)\n"
+            "5. Return here and upload that exported file to generate the Phase 2 files",
             icon="i",
         )
         st.markdown("")
@@ -593,6 +619,9 @@ def _build_vdata(base, mappings, property_code):
                 "Status":"✅ Active" if active>0 else "— Inactive"})
 
     status_lbl = {0:"🟢 Current",4:"🟡 Notice",6:"🔵 Future",10:"🔴 Eviction",5:"🟠 Former/Bal"}
+
+    # Preview rows (60) for the Streamlit table
+    tn_rows = []
     for t in sorted(t_vals, key=lambda x: x["unit_code"] or "9999")[:60]:
         tn_rows.append({"Unit":t["unit_code"],"Name":f"{t['last_name']}, {t['first_name']}",
             "Status":status_lbl.get(t["status"],"?"),
@@ -600,6 +629,42 @@ def _build_vdata(base, mappings, property_code):
             "Rent":f"${t['rent']:,}" if t["rent"] else "–",
             "Email":"✅" if t["email"] else "❌",
             "Phone":"✅" if (t["phone1"] or t["phone2"]) else "❌"})
+
+    # Full tenant list for the Excel workbook (all tenants, sorted by unit)
+    tn_full = []
+    for t in sorted(t_vals, key=lambda x: x["unit_code"] or "9999"):
+        tn_full.append({
+            "Unit":         t["unit_code"],
+            "Name":         f"{t['last_name']}, {t['first_name']}",
+            "Status":       status_lbl.get(t["status"],"?"),
+            "status_code":  t["status"],
+            "has_email":    bool(t["email"]),
+            "has_phone":    bool(t["phone1"] or t["phone2"]),
+            "Lease From":   t["lease_from"] or "",
+            "Lease To":     t["lease_to"]   or "",
+            "Rent":         t["rent"] or 0,
+            "Email":        "✅" if t["email"] else "❌",
+            "Phone":        "✅" if (t["phone1"] or t["phone2"]) else "❌",
+        })
+
+    # Warnings list
+    warnings = []
+    if unmapped_ut:
+        warnings.append({"level":"ERROR","msg":"Floor plan(s) not in Takeover Guide",
+            "items":[r["OneSite Code"] for r in unmapped_ut]})
+    if no_em:
+        warnings.append({"level":"WARN","msg":f"{len(no_em)} tenant(s) missing email address",
+            "items":[f"{t['unit_code']} {t['last_name']}" for t in no_em[:20]]})
+    if no_ph:
+        warnings.append({"level":"WARN","msg":f"{len(no_ph)} tenant(s) missing phone number",
+            "items":[f"{t['unit_code']} {t['last_name']}" for t in no_ph[:20]]})
+    if no_sg:
+        warnings.append({"level":"INFO","msg":f"{len(no_sg)} tenant(s) missing lease sign date",
+            "items":[f"{t['unit_code']} {t['last_name']}" for t in no_sg[:20]]})
+    auto_amenities = [r for r in am_rows if "Auto" in r["Status"]]
+    if auto_amenities:
+        warnings.append({"level":"WARN","msg":f"{len(auto_amenities)} amenity/amenities not in Takeover Guide (using source name as code)",
+            "items":[r["OneSite Name"] for r in auto_amenities]})
 
     assigned  = rent_items[rent_items["status"].isin(["In Use","Leased","NTV"])]
     available = rent_items[rent_items["status"]=="Unassigned"]
@@ -612,5 +677,6 @@ def _build_vdata(base, mappings, property_code):
                    "ri_policies":len(ins_df),"prospects":len(pros_df)},
         "quality":{"no_email":no_em,"no_phone":no_ph,"no_sign":no_sg},
         "unit_types":ut_rows,"amenities":am_rows,"charges":ch_rows,
-        "tenants":tn_rows,"unmapped_ut":unmapped_ut,
+        "tenants":tn_rows,"tenants_full":tn_full,
+        "unmapped_ut":unmapped_ut,"warnings":warnings,
     }

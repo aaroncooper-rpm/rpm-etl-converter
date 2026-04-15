@@ -1210,3 +1210,276 @@ def run_phase2(base, output_dir, mappings, property_code,
     log(f"\n🎉 Phase 2 complete → {zip_path}")
     return generated, zip_path
 
+
+
+# ─────────────────── VALIDATION WORKBOOK ─────────────────────────────────────
+
+def build_validation_workbook(vdata, mappings, property_code, tenants, output_path):
+    """
+    Build a multi-sheet Excel validation workbook.
+    Sheets:
+      1. Summary       — counts by status, quality flags, property info
+      2. Tenants        — full roster (all statuses, all columns)
+      3. Quality Flags  — tenants missing email / phone / lease sign date
+      4. Unit Types     — floor plan → Yardi code mapping
+      5. Amenities      — amenity code + monthly charge mapping
+      6. Charge Codes   — OneSite column → Yardi transaction code mapping
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import (Font, PatternFill, Alignment,
+                                  Border, Side, GradientFill)
+    from openpyxl.utils import get_column_letter
+    from datetime import datetime as _dt
+
+    wb = Workbook()
+    wb.remove(wb.active)   # remove default sheet
+
+    # ── colour palette ────────────────────────────────────────────────────────
+    DARK_BLUE   = "1F4E79"
+    MID_BLUE    = "2E75B6"
+    LIGHT_BLUE  = "BDD7EE"
+    GREEN       = "375623"
+    LIGHT_GREEN = "E2EFDA"
+    ORANGE      = "C65911"
+    LIGHT_ORANGE= "FCE4D6"
+    RED         = "C00000"
+    LIGHT_RED   = "FFDBE0"
+    GREY_FILL   = "F2F2F2"
+    WHITE       = "FFFFFF"
+    YELLOW      = "FFFF00"
+
+    def hdr_font(bold=True, colour=WHITE, sz=10):
+        return Font(name="Calibri", bold=bold, color=colour, size=sz)
+
+    def data_font(bold=False, colour="000000", sz=9):
+        return Font(name="Calibri", bold=bold, color=colour, size=sz)
+
+    def fill(hex_colour):
+        return PatternFill("solid", start_color=hex_colour)
+
+    def thin_border():
+        s = Side(style="thin", color="BFBFBF")
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    def set_col_widths(ws, widths):
+        for col, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(col)].width = w
+
+    def write_header_row(ws, row_num, headers, bg=DARK_BLUE, fg=WHITE, height=20):
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(row_num, ci, h)
+            c.font      = hdr_font(colour=fg)
+            c.fill      = fill(bg)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.row_dimensions[row_num].height = height
+
+    def write_data_row(ws, row_num, values, bg=None, bold=False):
+        for ci, v in enumerate(values, 1):
+            c = ws.cell(row_num, ci, v)
+            c.font   = data_font(bold=bold)
+            c.border = thin_border()
+            if bg:
+                c.fill = fill(bg)
+            c.alignment = Alignment(vertical="center", wrap_text=True)
+
+    # ═══════════════════════════════════════════════════════
+    #  SHEET 1 — SUMMARY
+    # ═══════════════════════════════════════════════════════
+    ws1 = wb.create_sheet("Summary")
+    S   = vdata["summary"]
+    Q   = vdata["quality"]
+
+    # Property header block
+    ws1["A1"] = "RPM Living · Yardi ETL Conversion — Validation Report"
+    ws1["A1"].font = Font(name="Calibri", bold=True, size=14, color=DARK_BLUE)
+    ws1["A2"] = f"Property: {mappings.get('prop_name','Unknown')}  |  Code: {property_code}  |  Generated: {_dt.now().strftime('%Y-%m-%d %H:%M')}"
+    ws1["A2"].font = Font(name="Calibri", italic=True, size=10, color="595959")
+    ws1.merge_cells("A1:H1"); ws1.merge_cells("A2:H2")
+    ws1.row_dimensions[1].height = 24; ws1.row_dimensions[2].height = 16
+
+    # Tenant counts section
+    ws1["A4"] = "TENANT COUNTS"
+    ws1["A4"].font = Font(name="Calibri", bold=True, size=11, color=DARK_BLUE)
+    counts = [
+        ("Current Residents",       S["current"],    MID_BLUE,    WHITE),
+        ("On Notice",               S["notice"],     "C65911",    WHITE),
+        ("Future / Applicants",     S["future"],     "375623",    WHITE),
+        ("Eviction Proceedings",    S["eviction"],   "C00000",    WHITE),
+        ("Former w/ Balance",       S["former_bal"], "7030A0",    WHITE),
+        ("Total Tenant Records",    S["current"]+S["notice"]+S["future"]+S["eviction"]+S["former_bal"], DARK_BLUE, WHITE),
+    ]
+    write_header_row(ws1, 5, ["Category","Count"], bg=DARK_BLUE)
+    for ri, (label, count, bg, fg) in enumerate(counts, 6):
+        ws1.cell(ri, 1, label).font  = data_font(bold=(ri==11))
+        ws1.cell(ri, 1).fill         = fill(LIGHT_BLUE if ri % 2 == 0 else WHITE)
+        ws1.cell(ri, 1).border       = thin_border()
+        ws1.cell(ri, 2, count).font  = data_font(bold=True)
+        ws1.cell(ri, 2).alignment    = Alignment(horizontal="center")
+        ws1.cell(ri, 2).border       = thin_border()
+
+    # Property info section
+    ws1["D4"] = "PROPERTY INFO"
+    ws1["D4"].font = Font(name="Calibri", bold=True, size=11, color=DARK_BLUE)
+    prop_info = [
+        ("Property Name",  mappings.get("prop_name","")),
+        ("Property Code",  property_code),
+        ("Address",        mappings.get("address","")),
+        ("City / State",   f"{mappings.get('city','')} {mappings.get('state','')} {mappings.get('zipcode','')}"),
+        ("Prefix",         mappings.get("prop_prefix","")),
+        ("Total Units",    S["total_units"]),
+        ("Unit Types",     len(mappings.get("unit_type_map",{}))),
+        ("Amenity Types",  len(mappings.get("amenity_map",{}))),
+        ("RI Policies",    S["ri_policies"]),
+        ("Prospects",      S["prospects"]),
+    ]
+    write_header_row(ws1, 5, ["","Field","Value"], bg=DARK_BLUE)
+    for ri, (field, val) in enumerate(prop_info, 6):
+        ws1.cell(ri, 4, field).font   = data_font(bold=True)
+        ws1.cell(ri, 4).border        = thin_border()
+        ws1.cell(ri, 4).fill          = fill(LIGHT_BLUE if ri%2==0 else WHITE)
+        ws1.cell(ri, 5, str(val)).font= data_font()
+        ws1.cell(ri, 5).border        = thin_border()
+        ws1.cell(ri, 5).fill          = fill(LIGHT_BLUE if ri%2==0 else WHITE)
+
+    # Quality flags section
+    row = 17
+    ws1.cell(row, 1, "DATA QUALITY FLAGS").font = Font(name="Calibri", bold=True, size=11, color=DARK_BLUE)
+    row += 1
+    write_header_row(ws1, row, ["Flag","Count","Status"], bg=MID_BLUE)
+    row += 1
+    quality_checks = [
+        ("Missing Email",          len(Q["no_email"]),  len(Q["no_email"])==0),
+        ("Missing Phone",          len(Q["no_phone"]),  len(Q["no_phone"])==0),
+        ("Missing Lease Sign Date",len(Q["no_sign"]),   len(Q["no_sign"])==0),
+        ("Unmapped Floor Plans",   len(vdata["unmapped_ut"]), len(vdata["unmapped_ut"])==0),
+    ]
+    for flag, count, ok in quality_checks:
+        bg_row = LIGHT_GREEN if ok else LIGHT_RED
+        ws1.cell(row, 1, flag).font   = data_font()
+        ws1.cell(row, 1).fill         = fill(bg_row); ws1.cell(row, 1).border = thin_border()
+        ws1.cell(row, 2, count).font  = data_font(bold=True)
+        ws1.cell(row, 2).fill         = fill(bg_row); ws1.cell(row, 2).border = thin_border()
+        ws1.cell(row, 2).alignment    = Alignment(horizontal="center")
+        status_txt = "✓ OK" if ok else f"⚠ {count} issue(s)"
+        ws1.cell(row, 3, status_txt).font  = data_font(bold=True, colour=GREEN if ok else RED)
+        ws1.cell(row, 3).fill              = fill(bg_row); ws1.cell(row, 3).border = thin_border()
+        row += 1
+
+    set_col_widths(ws1, [28, 10, 2, 22, 32])
+    ws1.freeze_panes = "A3"
+
+
+    # ═══════════════════════════════════════════════════════
+    #  SHEET 2 — FULL TENANT ROSTER
+    # ═══════════════════════════════════════════════════════
+    ws2 = wb.create_sheet("Tenants")
+    STATUS_LABEL = {0:"Current",4:"Notice",6:"Future",10:"Eviction",5:"Former/Balance"}
+    STATUS_COLOUR= {0:LIGHT_BLUE, 4:LIGHT_ORANGE, 6:LIGHT_GREEN, 10:LIGHT_RED, 5:"EAD1DC"}
+
+    hdrs2 = ["Unit","Status","Last Name","First Name","Move In","Lease From","Lease To",
+             "Sign Date","Rent","Deposit","Term","Phone 1","Phone 2","Email","Address","City","State","Zip"]
+    write_header_row(ws2, 1, hdrs2, bg=DARK_BLUE, height=22)
+
+    all_tenants = sorted(tenants.values(), key=lambda t: (t.get("unit_code") or "9999", t.get("last_name","")))
+    for ri, t in enumerate(all_tenants, 2):
+        status_code = t.get("status", 0)
+        row_bg = STATUS_COLOUR.get(status_code, WHITE)
+        vals = [
+            t.get("unit_code"), STATUS_LABEL.get(status_code, str(status_code)),
+            t.get("last_name"), t.get("first_name"),
+            t.get("move_in"),   t.get("lease_from"), t.get("lease_to"), t.get("lease_sign"),
+            t.get("rent"),      t.get("deposit"),     t.get("lease_term"),
+            t.get("phone1"),    t.get("phone2"),      t.get("email"),
+            t.get("address1"),  t.get("city"),        t.get("state"),  t.get("zipcode"),
+        ]
+        write_data_row(ws2, ri, vals, bg=row_bg)
+
+    set_col_widths(ws2, [7,12,16,14,11,11,11,11,9,9,6,14,14,28,30,14,6,10])
+    ws2.freeze_panes = "A2"
+    ws2.auto_filter.ref = f"A1:R1"
+
+
+    # ═══════════════════════════════════════════════════════
+    #  SHEET 3 — QUALITY FLAGS
+    # ═══════════════════════════════════════════════════════
+    ws3 = wb.create_sheet("Quality Flags")
+    ws3["A1"] = "Tenants with data quality issues — review before importing to Yardi"
+    ws3["A1"].font = Font(name="Calibri", bold=True, size=11, color=DARK_BLUE)
+    ws3.merge_cells("A1:H1")
+
+    sections = [
+        ("Missing Email",          Q["no_email"],  LIGHT_RED),
+        ("Missing Phone Number",   Q["no_phone"],  LIGHT_ORANGE),
+        ("Missing Lease Sign Date",Q["no_sign"],   LIGHT_BLUE),
+    ]
+
+    row = 3
+    for section_title, items, bg in sections:
+        if not items:
+            continue
+        ws3.cell(row, 1, f"{section_title} ({len(items)} tenant(s))").font = \
+            Font(name="Calibri", bold=True, size=10, color=DARK_BLUE)
+        ws3.merge_cells(f"A{row}:H{row}")
+        row += 1
+        write_header_row(ws3, row, ["Unit","Status","Last Name","First Name","Move In","Lease From","Rent","Email"], bg=MID_BLUE)
+        row += 1
+        for t in sorted(items, key=lambda x: x.get("unit_code") or ""):
+            vals = [
+                t.get("unit_code"),
+                STATUS_LABEL.get(t.get("status",0),"?"),
+                t.get("last_name"), t.get("first_name"),
+                t.get("move_in"),   t.get("lease_from"),
+                t.get("rent"),      t.get("email") or "MISSING",
+            ]
+            write_data_row(ws3, row, vals, bg=bg)
+            row += 1
+        row += 1   # blank row between sections
+
+    set_col_widths(ws3, [7,12,16,14,11,11,9,30])
+    ws3.freeze_panes = "A2"
+
+
+    # ═══════════════════════════════════════════════════════
+    #  SHEET 4 — UNIT TYPES
+    # ═══════════════════════════════════════════════════════
+    ws4 = wb.create_sheet("Unit Types")
+    hdrs4 = ["OneSite Code","Yardi Code","Description","Beds","Baths","SQFT","Market Rent","Total Units","Occupied","Status"]
+    write_header_row(ws4, 1, hdrs4, bg=DARK_BLUE)
+    for ri, r in enumerate(vdata["unit_types"], 2):
+        bg = LIGHT_GREEN if r["Status"]=="✅ Mapped" else LIGHT_RED
+        write_data_row(ws4, ri, [r[k] for k in hdrs4], bg=bg)
+    set_col_widths(ws4, [14,13,24,6,7,8,12,11,9,12])
+    ws4.freeze_panes = "A2"
+
+
+    # ═══════════════════════════════════════════════════════
+    #  SHEET 5 — AMENITIES
+    # ═══════════════════════════════════════════════════════
+    ws5 = wb.create_sheet("Amenities")
+    hdrs5 = ["OneSite Name","RPM Description","Yardi Code","Monthly Amt ($)","Units","Status"]
+    write_header_row(ws5, 1, hdrs5, bg=DARK_BLUE)
+    for ri, r in enumerate(vdata["amenities"], 2):
+        bg = LIGHT_GREEN if "Mapped" in r["Status"] else LIGHT_ORANGE
+        write_data_row(ws5, ri, [r[k] for k in hdrs5], bg=bg)
+    set_col_widths(ws5, [30,28,18,14,7,12])
+    ws5.freeze_panes = "A2"
+
+
+    # ═══════════════════════════════════════════════════════
+    #  SHEET 6 — CHARGE CODES
+    # ═══════════════════════════════════════════════════════
+    ws6 = wb.create_sheet("Charge Codes")
+    hdrs6 = ["OneSite Column","Yardi Code","Active Leases","Monthly Total ($)","Status"]
+    write_header_row(ws6, 1, hdrs6, bg=DARK_BLUE)
+    for ri, r in enumerate(vdata["charges"], 2):
+        bg = LIGHT_GREEN if "Active" in r["Status"] else GREY_FILL
+        write_data_row(ws6, ri, [r[k] for k in hdrs6], bg=bg)
+    set_col_widths(ws6, [18,13,13,16,12])
+    ws6.freeze_panes = "A2"
+
+    # ── Finish ────────────────────────────────────────────────────────────────
+    # Set Summary as the active sheet on open
+    wb.active = ws1
+
+    wb.save(output_path)
+    return output_path
