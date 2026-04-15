@@ -239,19 +239,27 @@ def _build_vdata(base, mappings, property_code):
 # ══════════════════════════════════════════════════════════
 if st.session_state.step == 1:
     st.markdown("### Upload Source Files")
-    st.markdown('<p style="color:#5a6a88;margin-bottom:22px">Both files are required. All property-specific mappings are read from the Takeover Guide — nothing is hardcoded.</p>', unsafe_allow_html=True)
+    st.markdown('<p style="color:#5a6a88;margin-bottom:22px">Upload the OneSite export files and the RPM Takeover Guide. Files are identified by their report title content — filenames and folder structure do not matter.</p>', unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("**📦 Conversion Final Reporting**")
-        st.caption("The OneSite export zip containing all reports")
-        src_file = st.file_uploader("Source ZIP", type=["zip"], key="src_zip", label_visibility="collapsed")
-    with col2:
         st.markdown("**📋 RPM Takeover Guide**")
-        st.caption("Excel workbook with all property mappings")
-        rpm_file = st.file_uploader("Takeover Guide", type=["xlsx","xls"], key="rpm_xlsx", label_visibility="collapsed")
+        st.caption("Excel workbook with all property-specific mappings")
+        rpm_file = st.file_uploader(
+            "Takeover Guide", type=["xlsx","xls"],
+            key="rpm_xlsx", label_visibility="collapsed"
+        )
+    with col2:
+        st.markdown("**📂 OneSite Export Files**")
+        st.caption("Select all OneSite report files at once — any format, any filename")
+        src_files = st.file_uploader(
+            "OneSite Reports", type=["xls","xlsx"],
+            key="src_files", label_visibility="collapsed",
+            accept_multiple_files=True
+        )
 
-    if src_file and rpm_file:
+    if rpm_file and src_files:
+        st.caption(f"✅ {len(src_files)} source file(s) selected")
         st.markdown("---")
         col_pc, col_bal = st.columns([1, 2])
         with col_pc:
@@ -275,24 +283,37 @@ if st.session_state.step == 1:
             if not prop_code.strip().isdigit():
                 st.error("Property code must be numeric (e.g. 13400)")
             else:
-                with st.spinner("Parsing Takeover Guide and loading source data..."):
+                with st.spinner("Identifying reports and loading source data..."):
                     try:
-                        tmp_g = tempfile.mkdtemp(); tmp_s = tempfile.mkdtemp()
+                        tmp_g = tempfile.mkdtemp()
+                        tmp_s = tempfile.mkdtemp()
                         st.session_state.tmp_dirs.extend([tmp_g, tmp_s])
+
+                        # Save Takeover Guide
                         guide_path = os.path.join(tmp_g, "guide.xlsx")
                         with open(guide_path, "wb") as f: f.write(rpm_file.read())
-                        zip_path = os.path.join(tmp_s, "source.zip")
-                        with open(zip_path, "wb") as f: f.write(src_file.read())
-                        extract_dir = os.path.join(tmp_s, "extracted")
-                        with zipfile.ZipFile(zip_path) as zf: zf.extractall(extract_dir)
-                        base = None
-                        for root, _, fl in os.walk(extract_dir):
-                            if "Final Rent Roll Detail with Lease Charges.xls" in fl:
-                                base = root + "/"; break
-                        if not base:
-                            st.error("❌ Cannot find source files in zip."); st.stop()
+
+                        # Save all source files into a flat temp directory
+                        # Filenames are preserved so the report-title scanner can open each one
+                        for uf in src_files:
+                            dest = os.path.join(tmp_s, uf.name)
+                            with open(dest, "wb") as f: f.write(uf.read())
+
+                        base = tmp_s + "/"
+
                         import sys; sys.path.insert(0, os.path.dirname(__file__))
-                        from converter import load_takeover_guide
+                        from converter import load_takeover_guide, _scan_report_titles, _FILE_CACHE
+                        _FILE_CACHE.clear()   # force fresh scan for new upload
+                        matched = _scan_report_titles(base)
+
+                        # Confirm the Rent Roll (minimum required file) was found
+                        if "Final Rent Roll Detail with Lease Charges.xls" not in matched:
+                            st.error(
+                                "❌ Could not identify the Rent Roll report among the uploaded files. "
+                                "Please ensure 'Final Rent Roll Detail with Lease Charges' is included."
+                            )
+                            st.stop()
+
                         mappings = load_takeover_guide(guide_path)
                         vdata    = _build_vdata(base, mappings, prop_code.strip())
                         st.session_state.update({
@@ -303,10 +324,11 @@ if st.session_state.step == 1:
                     except Exception as e:
                         import traceback
                         st.error(f"❌ {e}"); st.code(traceback.format_exc())
-    elif src_file:
-        st.warning("⚠️ The RPM Takeover Guide is required — it contains unit types, amenity codes, and rentable item mappings.")
-    elif rpm_file:
-        st.info("ℹ️ Upload ConversionFinalReporting.zip to continue.")
+
+    elif not rpm_file and src_files:
+        st.warning("⚠️ Please also upload the RPM Takeover Guide — it contains all unit type, amenity, and property mappings.")
+    elif rpm_file and not src_files:
+        st.info("ℹ️ Upload the OneSite export files to continue.")
 
     # Workflow explainer
     st.markdown("---")
