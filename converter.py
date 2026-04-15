@@ -114,21 +114,106 @@ def load_former_records(base):
     return tenants
 
 
+# ── Report-title fingerprints ────────────────────────────────────────────────
+# Each tuple is (keywords_that_must_all_appear_in_first_12_rows, logical_name)
+# Matched case-insensitively against the first 12 rows × first 4 columns.
+_REPORT_FINGERPRINTS = {
+    # Fingerprints use 2+ unique keywords that together appear only in that report.
+    # More-specific entries are first; "ALL RESIDENTS" is last as a broad fallback.
+    "Final Rent Roll Detail with Lease Charges.xls": ["RENT ROLL DETAIL"],
+    "Resident Birthdays.xls":                        ["RESIDENT BIRTHDAYS"],
+    "Final All Unit.xls":                            ["ALL UNITS", "Amt/SQFT"],
+    "Renters Insurance Status Report.xlsx":          ["Renters Insurance Status Report"],
+    "Prospect Contact Level Details .xlsx":          ["Prospect Contact Level Details", "Guest Card ID"],
+    "Contract Level Detail.xlsx":                    ["Contact Level Details", "Emergency Contact"],
+    "Final Unit Setup View.xlsx":                    ["Unit Setup View"],
+    "Lease Details .xlsx":                           ["Lease Details", "Eviction proceedings"],
+    "Rentable and Assignable Items Status.xls":      ["Item Type - Rentable"],
+    "All Residents.xls":                             ["ALL RESIDENTS"],
+}
+
+# Cache: base_dir → {logical_name: resolved_path}
+_FILE_CACHE: dict[str, dict[str, str]] = {}
+
+
+def _scan_report_titles(base: str) -> dict[str, str]:
+    """Scan all Excel files in base, match by report-title fingerprint."""
+    import xlrd as _xlrd
+    from openpyxl import load_workbook as _lwb
+
+    result: dict[str, str] = {}
+
+    def _cell_texts(path: str) -> list[str]:
+        """Return all non-empty string cell values from first 12 rows (all cols)."""
+        texts = []
+        try:
+            if path.endswith(".xls"):
+                wb = _xlrd.open_workbook(path)
+                ws = wb.sheet_by_index(0)
+                for r in range(min(12, ws.nrows)):
+                    for c in range(ws.ncols):
+                        v = str(ws.cell_value(r, c)).strip()
+                        if v: texts.append(v)
+                wb.release_resources()
+            else:
+                wb = _lwb(path, read_only=True, data_only=True)
+                ws = wb.active
+                for i, row in enumerate(ws.iter_rows(max_row=12, values_only=True)):
+                    if i >= 12: break
+                    for v in row:
+                        if v: texts.append(str(v).strip())
+                wb.close()
+        except Exception:
+            pass
+        return texts
+
+    files = [f for f in os.listdir(base)
+             if f.lower().endswith((".xls", ".xlsx")) and not f.startswith("~")]
+
+    # Special case: Resident Birthdays has no title row — match by "Birthday" header
+    # We'll handle it via fingerprint keywords that appear in its header rows
+
+    for fname in files:
+        path = os.path.join(base, fname)
+        texts = _cell_texts(path)
+        all_text = " ".join(texts).lower()
+
+        for logical_name, keywords in _REPORT_FINGERPRINTS.items():
+            if logical_name in result:
+                continue   # already matched
+            # All keywords must appear (case-insensitive) in the combined text
+            if all(kw.lower() in all_text for kw in keywords):
+                result[logical_name] = path
+                break
+
+    return result
+
+
 def _find_file(base: str, name: str) -> str:
-    """Find a file by name, falling back from .xls to .xlsx if needed."""
+    """
+    Locate a source file by its report-title content rather than filename.
+    Falls back to filename-based lookup if the scanner cannot find a match.
+    """
+    # Normalise base
+    if not base.endswith(os.sep):
+        base = base + os.sep
+
+    if base not in _FILE_CACHE:
+        _FILE_CACHE[base] = _scan_report_titles(base)
+
+    resolved = _FILE_CACHE[base].get(name)
+    if resolved and os.path.exists(resolved):
+        return resolved
+
+    # Fallback: try exact filename, then swap extension
     p = base + name
     if os.path.exists(p):
         return p
-    # Try swapping extension
-    if name.endswith(".xls"):
-        alt = base + name + "x"  # .xls -> .xlsx
-        if os.path.exists(alt):
-            return alt
-    if name.endswith(".xlsx"):
-        alt = base + name[:-1]  # .xlsx -> .xls
-        if os.path.exists(alt):
-            return alt
-    return p  # return original even if missing (will raise clear error)
+    if name.endswith(".xls") and os.path.exists(base + name + "x"):
+        return base + name + "x"
+    if name.endswith(".xlsx") and os.path.exists(base + name[:-1]):
+        return base + name[:-1]
+    return p  # will produce a clear FileNotFoundError downstream
 
 
 # ─────────────────────────── TAKEOVER GUIDE PARSER ───────────────────────────
