@@ -86,6 +86,155 @@ with col_steps:
 st.markdown('<hr style="border:none;border-top:1px solid #1e2840;margin:14px 0">', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
+#  SHARED — build validation data
+# ══════════════════════════════════════════════════════════
+def _build_vdata(base, mappings, property_code):
+    from converter import (
+        load_rent_roll, load_lease_details, load_contract_details,
+        load_all_residents, load_unit_setup, load_rentable_items,
+        load_insurance, load_prospects, load_all_unit, load_birthdays,
+        build_tenant_base, load_former_records, CHARGE_CODE_MAP, _find_file,
+    )
+    import pandas as _pd
+
+    rr         = load_rent_roll(base)
+    ld_idx     = load_lease_details(base)
+    cld        = load_contract_details(base)
+    all_res    = load_all_residents(base)
+    unit_setup = load_unit_setup(base)
+    rent_items = load_rentable_items(base)
+    ins_df     = load_insurance(base)
+    pros_df    = load_prospects(base)
+    all_unit   = load_all_unit(base)
+    bdays      = load_birthdays(base)
+    tenants    = build_tenant_base(rr, ld_idx, cld, bdays, mappings, property_code)
+
+    # Eviction promotion
+    try:
+        ld_ev = _pd.read_excel(_find_file(base,"Lease Details .xlsx"), header=8)
+        evict_ids = set(
+            ld_ev[ld_ev["Eviction proceedings started"]=="Yes"]["Household ID/ Resh ID"]
+            .dropna().apply(lambda x: int(float(x)) if str(x).replace(".0","").isdigit() else 0)
+        )
+        for rid,t in tenants.items():
+            if rid in evict_ids and t["status"]==0: t["status"]=10
+    except Exception: pass
+
+    for rid,t in load_former_records(base).items():
+        if rid not in tenants: tenants[rid]=t
+
+    t_vals = list(tenants.values())
+    curr   = [t for t in t_vals if t["status"]==0]
+    notice = [t for t in t_vals if t["status"]==4]
+    future = [t for t in t_vals if t["status"]==6]
+    evict  = [t for t in t_vals if t["status"]==10]
+    fbal   = [t for t in t_vals if t["status"]==5]
+    no_em  = [t for t in t_vals if not t["email"]]
+    no_ph  = [t for t in t_vals if not t["phone1"] and not t["phone2"]]
+    no_sg  = [t for t in t_vals if not t["lease_sign"]]
+
+    fps = sorted(rr["Floorplan"].dropna().unique())
+    ut_rows, am_rows, ch_rows, tn_rows, unmapped_ut = [], [], [], [], []
+
+    for fp in fps:
+        ut  = mappings["unit_type_map"].get(fp)
+        sub = rr[rr["Floorplan"]==fp]
+        occ = len(sub[sub["Unit/Lease Status"]=="Occupied"])
+        tot = len(sub["unit_code"].unique())
+        if ut:
+            ut_rows.append({"OneSite Code":fp,"Yardi Code":ut["yardi_code"],
+                "Description":ut.get("desc",""),"Beds":ut["beds"],"Baths":int(ut["baths"]),
+                "SQFT":ut["sqft"],"Market Rent":ut["rent"],
+                "Total Units":tot,"Occupied":occ,"Status":"✅ Mapped"})
+        else:
+            rec = {"OneSite Code":fp,"Yardi Code":"UNMAPPED","Description":"",
+                   "Beds":"","Baths":"","SQFT":"","Market Rent":"",
+                   "Total Units":tot,"Occupied":occ,"Status":"❌ Missing"}
+            ut_rows.append(rec); unmapped_ut.append(rec)
+
+    for name in sorted(unit_setup["Unit amenity Name"].dropna().unique()):
+        mapped = mappings["amenity_map"].get(name)
+        cnt = int((unit_setup["Unit amenity Name"]==name).sum())
+        if mapped:
+            desc,code,amt = mapped
+            am_rows.append({"OneSite Name":name,"RPM Description":desc,"Yardi Code":code,
+                "Monthly Amt ($)":amt,"Units":cnt,"Status":"✅ Mapped"})
+        else:
+            am_rows.append({"OneSite Name":name,"RPM Description":name,"Yardi Code":name[:15],
+                "Monthly Amt ($)":0,"Units":cnt,"Status":"⚠️ Auto"})
+
+    for col,ycode in CHARGE_CODE_MAP.items():
+        if col in rr.columns:
+            active = int((rr[col].fillna(0)!=0).sum())
+            total_amt = float(rr[col].fillna(0).abs().sum())
+            ch_rows.append({"OneSite Column":col,"Yardi Code":ycode,
+                "Active Leases":active,"Monthly Total ($)":round(total_amt,2),
+                "Status":"✅ Active" if active>0 else "— Inactive"})
+
+    status_lbl = {0:"🟢 Current",4:"🟡 Notice",6:"🔵 Future",10:"🔴 Eviction",5:"🟠 Former/Bal"}
+
+    # Preview rows (60) for the Streamlit table
+    tn_rows = []
+    for t in sorted(t_vals, key=lambda x: x["unit_code"] or "9999")[:60]:
+        tn_rows.append({"Unit":t["unit_code"],"Name":f"{t['last_name']}, {t['first_name']}",
+            "Status":status_lbl.get(t["status"],"?"),
+            "Lease From":t["lease_from"] or "–","Lease To":t["lease_to"] or "–",
+            "Rent":f"${t['rent']:,}" if t["rent"] else "–",
+            "Email":"✅" if t["email"] else "❌",
+            "Phone":"✅" if (t["phone1"] or t["phone2"]) else "❌"})
+
+    # Full tenant list for the Excel workbook (all tenants, sorted by unit)
+    tn_full = []
+    for t in sorted(t_vals, key=lambda x: x["unit_code"] or "9999"):
+        tn_full.append({
+            "Unit":         t["unit_code"],
+            "Name":         f"{t['last_name']}, {t['first_name']}",
+            "Status":       status_lbl.get(t["status"],"?"),
+            "status_code":  t["status"],
+            "has_email":    bool(t["email"]),
+            "has_phone":    bool(t["phone1"] or t["phone2"]),
+            "Lease From":   t["lease_from"] or "",
+            "Lease To":     t["lease_to"]   or "",
+            "Rent":         t["rent"] or 0,
+            "Email":        "✅" if t["email"] else "❌",
+            "Phone":        "✅" if (t["phone1"] or t["phone2"]) else "❌",
+        })
+
+    # Warnings list
+    warnings = []
+    if unmapped_ut:
+        warnings.append({"level":"ERROR","msg":"Floor plan(s) not in Takeover Guide",
+            "items":[r["OneSite Code"] for r in unmapped_ut]})
+    if no_em:
+        warnings.append({"level":"WARN","msg":f"{len(no_em)} tenant(s) missing email address",
+            "items":[f"{t['unit_code']} {t['last_name']}" for t in no_em[:20]]})
+    if no_ph:
+        warnings.append({"level":"WARN","msg":f"{len(no_ph)} tenant(s) missing phone number",
+            "items":[f"{t['unit_code']} {t['last_name']}" for t in no_ph[:20]]})
+    if no_sg:
+        warnings.append({"level":"INFO","msg":f"{len(no_sg)} tenant(s) missing lease sign date",
+            "items":[f"{t['unit_code']} {t['last_name']}" for t in no_sg[:20]]})
+    auto_amenities = [r for r in am_rows if "Auto" in r["Status"]]
+    if auto_amenities:
+        warnings.append({"level":"WARN","msg":f"{len(auto_amenities)} amenity/amenities not in Takeover Guide (using source name as code)",
+            "items":[r["OneSite Name"] for r in auto_amenities]})
+
+    assigned  = rent_items[rent_items["status"].isin(["In Use","Leased","NTV"])]
+    available = rent_items[rent_items["status"]=="Unassigned"]
+
+    return {
+        "summary":{"current":len(curr),"notice":len(notice),"future":len(future),
+                   "eviction":len(evict),"former_bal":len(fbal),
+                   "total_units":len(rr["unit_code"].unique()),
+                   "garages_assigned":len(assigned),"garages_available":len(available),
+                   "ri_policies":len(ins_df),"prospects":len(pros_df)},
+        "quality":{"no_email":no_em,"no_phone":no_ph,"no_sign":no_sg},
+        "unit_types":ut_rows,"amenities":am_rows,"charges":ch_rows,
+        "tenants":tn_rows,"tenants_full":tn_full,
+        "unmapped_ut":unmapped_ut,"warnings":warnings,
+    }
+
 #  STEP 1 — UPLOAD
 # ══════════════════════════════════════════════════════════
 if st.session_state.step == 1:
@@ -532,151 +681,3 @@ elif st.session_state.step == 5:
         if st.button("↩ Convert Another Property"): reset()
 
 
-# ══════════════════════════════════════════════════════════
-#  SHARED — build validation data
-# ══════════════════════════════════════════════════════════
-def _build_vdata(base, mappings, property_code):
-    from converter import (
-        load_rent_roll, load_lease_details, load_contract_details,
-        load_all_residents, load_unit_setup, load_rentable_items,
-        load_insurance, load_prospects, load_all_unit, load_birthdays,
-        build_tenant_base, load_former_records, CHARGE_CODE_MAP, _find_file,
-    )
-    import pandas as _pd
-
-    rr         = load_rent_roll(base)
-    ld_idx     = load_lease_details(base)
-    cld        = load_contract_details(base)
-    all_res    = load_all_residents(base)
-    unit_setup = load_unit_setup(base)
-    rent_items = load_rentable_items(base)
-    ins_df     = load_insurance(base)
-    pros_df    = load_prospects(base)
-    all_unit   = load_all_unit(base)
-    bdays      = load_birthdays(base)
-    tenants    = build_tenant_base(rr, ld_idx, cld, bdays, mappings, property_code)
-
-    # Eviction promotion
-    try:
-        ld_ev = _pd.read_excel(_find_file(base,"Lease Details .xlsx"), header=8)
-        evict_ids = set(
-            ld_ev[ld_ev["Eviction proceedings started"]=="Yes"]["Household ID/ Resh ID"]
-            .dropna().apply(lambda x: int(float(x)) if str(x).replace(".0","").isdigit() else 0)
-        )
-        for rid,t in tenants.items():
-            if rid in evict_ids and t["status"]==0: t["status"]=10
-    except Exception: pass
-
-    for rid,t in load_former_records(base).items():
-        if rid not in tenants: tenants[rid]=t
-
-    t_vals = list(tenants.values())
-    curr   = [t for t in t_vals if t["status"]==0]
-    notice = [t for t in t_vals if t["status"]==4]
-    future = [t for t in t_vals if t["status"]==6]
-    evict  = [t for t in t_vals if t["status"]==10]
-    fbal   = [t for t in t_vals if t["status"]==5]
-    no_em  = [t for t in t_vals if not t["email"]]
-    no_ph  = [t for t in t_vals if not t["phone1"] and not t["phone2"]]
-    no_sg  = [t for t in t_vals if not t["lease_sign"]]
-
-    fps = sorted(rr["Floorplan"].dropna().unique())
-    ut_rows, am_rows, ch_rows, tn_rows, unmapped_ut = [], [], [], [], []
-
-    for fp in fps:
-        ut  = mappings["unit_type_map"].get(fp)
-        sub = rr[rr["Floorplan"]==fp]
-        occ = len(sub[sub["Unit/Lease Status"]=="Occupied"])
-        tot = len(sub["unit_code"].unique())
-        if ut:
-            ut_rows.append({"OneSite Code":fp,"Yardi Code":ut["yardi_code"],
-                "Description":ut.get("desc",""),"Beds":ut["beds"],"Baths":int(ut["baths"]),
-                "SQFT":ut["sqft"],"Market Rent":ut["rent"],
-                "Total Units":tot,"Occupied":occ,"Status":"✅ Mapped"})
-        else:
-            rec = {"OneSite Code":fp,"Yardi Code":"UNMAPPED","Description":"",
-                   "Beds":"","Baths":"","SQFT":"","Market Rent":"",
-                   "Total Units":tot,"Occupied":occ,"Status":"❌ Missing"}
-            ut_rows.append(rec); unmapped_ut.append(rec)
-
-    for name in sorted(unit_setup["Unit amenity Name"].dropna().unique()):
-        mapped = mappings["amenity_map"].get(name)
-        cnt = int((unit_setup["Unit amenity Name"]==name).sum())
-        if mapped:
-            desc,code,amt = mapped
-            am_rows.append({"OneSite Name":name,"RPM Description":desc,"Yardi Code":code,
-                "Monthly Amt ($)":amt,"Units":cnt,"Status":"✅ Mapped"})
-        else:
-            am_rows.append({"OneSite Name":name,"RPM Description":name,"Yardi Code":name[:15],
-                "Monthly Amt ($)":0,"Units":cnt,"Status":"⚠️ Auto"})
-
-    for col,ycode in CHARGE_CODE_MAP.items():
-        if col in rr.columns:
-            active = int((rr[col].fillna(0)!=0).sum())
-            total_amt = float(rr[col].fillna(0).abs().sum())
-            ch_rows.append({"OneSite Column":col,"Yardi Code":ycode,
-                "Active Leases":active,"Monthly Total ($)":round(total_amt,2),
-                "Status":"✅ Active" if active>0 else "— Inactive"})
-
-    status_lbl = {0:"🟢 Current",4:"🟡 Notice",6:"🔵 Future",10:"🔴 Eviction",5:"🟠 Former/Bal"}
-
-    # Preview rows (60) for the Streamlit table
-    tn_rows = []
-    for t in sorted(t_vals, key=lambda x: x["unit_code"] or "9999")[:60]:
-        tn_rows.append({"Unit":t["unit_code"],"Name":f"{t['last_name']}, {t['first_name']}",
-            "Status":status_lbl.get(t["status"],"?"),
-            "Lease From":t["lease_from"] or "–","Lease To":t["lease_to"] or "–",
-            "Rent":f"${t['rent']:,}" if t["rent"] else "–",
-            "Email":"✅" if t["email"] else "❌",
-            "Phone":"✅" if (t["phone1"] or t["phone2"]) else "❌"})
-
-    # Full tenant list for the Excel workbook (all tenants, sorted by unit)
-    tn_full = []
-    for t in sorted(t_vals, key=lambda x: x["unit_code"] or "9999"):
-        tn_full.append({
-            "Unit":         t["unit_code"],
-            "Name":         f"{t['last_name']}, {t['first_name']}",
-            "Status":       status_lbl.get(t["status"],"?"),
-            "status_code":  t["status"],
-            "has_email":    bool(t["email"]),
-            "has_phone":    bool(t["phone1"] or t["phone2"]),
-            "Lease From":   t["lease_from"] or "",
-            "Lease To":     t["lease_to"]   or "",
-            "Rent":         t["rent"] or 0,
-            "Email":        "✅" if t["email"] else "❌",
-            "Phone":        "✅" if (t["phone1"] or t["phone2"]) else "❌",
-        })
-
-    # Warnings list
-    warnings = []
-    if unmapped_ut:
-        warnings.append({"level":"ERROR","msg":"Floor plan(s) not in Takeover Guide",
-            "items":[r["OneSite Code"] for r in unmapped_ut]})
-    if no_em:
-        warnings.append({"level":"WARN","msg":f"{len(no_em)} tenant(s) missing email address",
-            "items":[f"{t['unit_code']} {t['last_name']}" for t in no_em[:20]]})
-    if no_ph:
-        warnings.append({"level":"WARN","msg":f"{len(no_ph)} tenant(s) missing phone number",
-            "items":[f"{t['unit_code']} {t['last_name']}" for t in no_ph[:20]]})
-    if no_sg:
-        warnings.append({"level":"INFO","msg":f"{len(no_sg)} tenant(s) missing lease sign date",
-            "items":[f"{t['unit_code']} {t['last_name']}" for t in no_sg[:20]]})
-    auto_amenities = [r for r in am_rows if "Auto" in r["Status"]]
-    if auto_amenities:
-        warnings.append({"level":"WARN","msg":f"{len(auto_amenities)} amenity/amenities not in Takeover Guide (using source name as code)",
-            "items":[r["OneSite Name"] for r in auto_amenities]})
-
-    assigned  = rent_items[rent_items["status"].isin(["In Use","Leased","NTV"])]
-    available = rent_items[rent_items["status"]=="Unassigned"]
-
-    return {
-        "summary":{"current":len(curr),"notice":len(notice),"future":len(future),
-                   "eviction":len(evict),"former_bal":len(fbal),
-                   "total_units":len(rr["unit_code"].unique()),
-                   "garages_assigned":len(assigned),"garages_available":len(available),
-                   "ri_policies":len(ins_df),"prospects":len(pros_df)},
-        "quality":{"no_email":no_em,"no_phone":no_ph,"no_sign":no_sg},
-        "unit_types":ut_rows,"amenities":am_rows,"charges":ch_rows,
-        "tenants":tn_rows,"tenants_full":tn_full,
-        "unmapped_ut":unmapped_ut,"warnings":warnings,
-    }
