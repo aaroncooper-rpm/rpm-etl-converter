@@ -356,19 +356,24 @@ elif st.session_state.step == 2:
     for col, lbl, val in zip(cols8, ["Current","On Notice","Future","Eviction",
         "Former w/Bal" if include_former else "Fmr/Bal (excl)","Total Units","RI Policies","Prospects"],
         [S["current"],S["notice"],S["future"],S["eviction"],
-         S["former_bal"] if include_former else f"~~{S['former_bal']}~~",
+         S["former_bal"] if include_former else f"{S['former_bal']} (excl)",
          S["total_units"],S["ri_policies"],S["prospects"]]):
         col.metric(lbl, val)
 
     # Quality
     Q = v["quality"]
+    n_email = len(Q["no_email"])
+    n_phone = len(Q["no_phone"])
+    n_sign  = len(Q["no_sign"])
     qcols = st.columns(3)
-    for col,(lbl,ok,detail) in zip(qcols,[
-        ("Email",   Q["no_email"]==0, f"{Q['no_email']} missing"),
-        ("Phone",   Q["no_phone"]==0, f"{Q['no_phone']} missing"),
-        ("Sign Date",Q["no_sign"]==0, f"{Q['no_sign']} missing"),
-    ]):
-        col.success(f"✅ {lbl}") if ok else col.warning(f"⚠️ {lbl}: {detail}")
+    for col, lbl, count in zip(qcols,
+        ["Email", "Phone", "Lease Sign Date"],
+        [n_email, n_phone, n_sign],
+    ):
+        if count == 0:
+            col.success(f"✅ {lbl}: all present")
+        else:
+            col.warning(f"⚠️ {lbl}: {count} missing")
 
     st.markdown("")
     tab_ut, tab_am, tab_ch, tab_tn, tab_out = st.tabs([
