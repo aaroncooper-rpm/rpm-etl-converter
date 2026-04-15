@@ -534,7 +534,7 @@ elif st.session_state.step == 3:
             "3. Yardi assigns a unique Tenant_Code to each resident upon import\n"
             "4. Export the resident records from Yardi (the file will have the Tenant_Code column populated)\n"
             "5. Return here and upload that exported file to generate the Phase 2 files",
-            icon="i",
+            icon="ℹ️",
         )
         st.markdown("")
         if st.button("➡ Continue to Upload Yardi Resident Export", type="primary"):
