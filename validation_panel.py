@@ -177,7 +177,7 @@ def render_validation_panel(vdata: dict) -> None:
         st.caption(f"Showing **{len(filtered)}** flagged tenant(s).")
         st.dataframe(
             filtered.style
-                .applymap(_red_if_flagged, subset=issue_cols)
+                .map(_red_if_flagged, subset=issue_cols)
                 .format({"Lease Rent": "${:,.0f}"}, na_rep="—"),
             use_container_width=True,
             hide_index=True,
@@ -206,7 +206,7 @@ def render_validation_panel(vdata: dict) -> None:
 
         st.dataframe(
             rent_df.style
-                .applymap(_diff_colour, subset=["Difference"])
+                .map(_diff_colour, subset=["Difference"])
                 .format({
                     "Unit Rent":  "${:,.2f}",
                     "Lease Rent": "${:,.2f}",
