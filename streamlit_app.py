@@ -188,18 +188,52 @@ def _build_vdata(base, mappings, property_code):
     tn_full = []
     for t in sorted(t_vals, key=lambda x: x["unit_code"] or "9999"):
         tn_full.append({
-            "Unit":         t["unit_code"],
-            "Name":         f"{t['last_name']}, {t['first_name']}",
-            "Status":       status_lbl.get(t["status"],"?"),
-            "status_code":  t["status"],
-            "has_email":    bool(t["email"]),
-            "has_phone":    bool(t["phone1"] or t["phone2"]),
-            "Lease From":   t["lease_from"] or "",
-            "Lease To":     t["lease_to"]   or "",
-            "Rent":         t["rent"] or 0,
-            "Email":        "✅" if t["email"] else "❌",
-            "Phone":        "✅" if (t["phone1"] or t["phone2"]) else "❌",
+            "Unit":           t["unit_code"],
+            "Name":           f"{t['last_name']}, {t['first_name']}",
+            "Status":         status_lbl.get(t["status"],"?"),
+            "status_code":    t["status"],
+            "has_email":      bool(t["email"]),
+            "has_phone":      bool(t["phone1"] or t["phone2"]),
+            "has_sign_date":  bool(t.get("lease_sign")),
+            "floorplan":      t.get("floorplan", ""),
+            "Lease From":     t["lease_from"] or "",
+            "Lease To":       t["lease_to"]   or "",
+            "Rent":           t["rent"] or 0,
+            "Email":          "✅" if t["email"] else "❌",
+            "Phone":          "✅" if (t["phone1"] or t["phone2"]) else "❌",
         })
+
+    # ── Rent discrepancy: resident lease rent vs unit market rent (All Units) ──
+    unit_market_rent = {}
+    for _, row in all_unit.iterrows():
+        uc = row.get("unit_code", "")
+        mkt_raw = str(row.get("Market Rent", "0")).replace(",", "").replace("$", "").strip()
+        try:
+            mkt = float(mkt_raw)
+        except (ValueError, TypeError):
+            mkt = 0.0
+        if uc and mkt > 0:
+            unit_market_rent[uc] = mkt
+
+    rent_disc = []
+    for t in sorted(t_vals, key=lambda x: x["unit_code"] or "9999"):
+        uc         = t.get("unit_code", "")
+        lease_rent = float(t.get("rent") or 0)
+        unit_rent  = unit_market_rent.get(uc)
+        if unit_rent and abs(lease_rent - unit_rent) >= 0.01:
+            diff = round(lease_rent - unit_rent, 2)
+            pct  = round((diff / unit_rent) * 100, 1) if unit_rent else 0.0
+            rent_disc.append({
+                "Unit":       uc,
+                "Name":       f"{t['last_name']}, {t['first_name']}",
+                "Status":     status_lbl.get(t["status"], "?"),
+                "Floor Plan": t.get("floorplan", ""),
+                "Unit Rent":  unit_rent,
+                "Lease Rent": lease_rent,
+                "Difference": diff,
+                "% Diff":     pct,
+            })
+    rent_disc.sort(key=lambda x: x["Difference"])
 
     # Warnings list
     warnings = []
@@ -233,6 +267,7 @@ def _build_vdata(base, mappings, property_code):
         "unit_types":ut_rows,"amenities":am_rows,"charges":ch_rows,
         "tenants":tn_rows,"tenants_full":tn_full,
         "unmapped_ut":unmapped_ut,"warnings":warnings,
+        "rent_discrepancies":rent_disc,
     }
 
 #  STEP 1 — UPLOAD
@@ -427,8 +462,8 @@ elif st.session_state.step == 2:
         st.dataframe(pd.DataFrame(v["charges"]), use_container_width=True, hide_index=True)
 
     with tab_tn:
-        st.caption("First 60 tenant records. Status: 🟢 Current  🟡 Notice  🔵 Future  🔴 Eviction  🟠 Former/Bal")
-        st.dataframe(pd.DataFrame(v["tenants"]), use_container_width=True, hide_index=True)
+        from validation_panel import render_validation_panel
+        render_validation_panel(v)
 
     with tab_out:
         st.markdown("#### Phase 1 — Resident & Property Files *(Tenant_Code blank)*")
