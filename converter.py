@@ -1245,11 +1245,15 @@ def load_tcode_mapping(etl_file_paths, tenants):
 
 
 def run_phase2(base, output_dir, mappings, property_code,
-               tenants, tcode_map, progress_cb=None):
+               tenants, tcode_map, progress_cb=None, val_workbook_path=None):
     """
     Phase 2: Generate tcode-dependent files using the mapping returned by Yardi.
-    tenants: the tenant dict from Phase 1 (stored in session state).
-    tcode_map: {resh_id → yardi_tenant_code}
+    tenants:           the tenant dict from Phase 1 (stored in session state).
+    tcode_map:         {resh_id → yardi_tenant_code}
+    val_workbook_path: optional path to the Phase 1 Validation_Report.xlsx.
+                       When provided, three Phase 2 summary sheets are appended
+                       (P2 Lease Charges, P2 RI Policies, P2 Demographics) so
+                       the workbook covers both phases in one download.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1270,12 +1274,19 @@ def run_phase2(base, output_dir, mappings, property_code,
     insurance  = load_insurance(base)
 
     prop_code = property_code
+
+    # Generate all five Phase 2 outputs — capture data before writing to disk
+    # so we can pass the raw rows into the validation workbook function.
+    lc_cols,  lc_rows  = gen_lease_charges_p2(rr, tenants, prop_code, tcode_map)
+    ri_cols,  ri_rows  = gen_ri_policies_p2(insurance, tenants, prop_code, tcode_map)
+    demo_cols,demo_rows= gen_leasebut_demo_p2(rr, ld_idx, cld, tenants, prop_code, tcode_map)
+
     outputs = [
         ("ETL_ResRoommates",          *gen_roommates_p2(all_res, tenants, prop_code, tcode_map)),
-        ("ETL_RIPolicies",            *gen_ri_policies_p2(insurance, tenants, prop_code, tcode_map)),
-        ("ETL_ResLeaseCharges",       *gen_lease_charges_p2(rr, tenants, prop_code, tcode_map)),
+        ("ETL_RIPolicies",            ri_cols, ri_rows),
+        ("ETL_ResLeaseCharges",       lc_cols, lc_rows),
         ("ETL_ResManageRentableItems",*gen_manage_rentable_p2(rent_items, tenants, mappings, prop_code, tcode_map)),
-        ("ETL_leasebut_demo",         *gen_leasebut_demo_p2(rr, ld_idx, cld, tenants, prop_code, tcode_map)),
+        ("ETL_leasebut_demo",         demo_cols, demo_rows),
     ]
 
     ts = datetime.now().strftime("%y%m%d_%H%M%S")
@@ -1291,6 +1302,21 @@ def run_phase2(base, output_dir, mappings, property_code,
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for fp in generated:
             zf.write(fp, os.path.join("Phase2_ETL", os.path.basename(fp)))
+
+    # ── Append Phase 2 tabs to the validation workbook ────────────────────────
+    if val_workbook_path and os.path.exists(val_workbook_path):
+        try:
+            log("📊 Adding Phase 2 tabs to Validation Report...")
+            add_phase2_validation_tabs(
+                val_workbook_path,
+                lc_cols, lc_rows,
+                ri_cols, ri_rows,
+                demo_cols, demo_rows,
+                tcode_map, tenants, property_code,
+            )
+            log("   ✅ P2 Lease Charges, P2 RI Policies, P2 Demographics tabs added")
+        except Exception as _val_err:
+            log(f"   ⚠️ Validation tab update failed (ETL files unaffected): {_val_err}")
 
     log(f"\n🎉 Phase 2 complete → {zip_path}")
     return generated, zip_path
@@ -2232,3 +2258,413 @@ def build_validation_workbook(vdata, mappings, property_code, tenants, output_pa
 
     wb.save(output_path)
     return output_path
+
+
+# ─────────────────── PHASE 2 VALIDATION TABS ─────────────────────────────────
+
+def add_phase2_validation_tabs(wb_path,
+                                lc_cols, lc_rows,
+                                ri_cols, ri_rows,
+                                demo_cols, demo_rows,
+                                tcode_map, tenants, property_code):
+    """
+    Load the existing Phase 1 validation workbook and append three Phase 2
+    summary sheets:
+
+      P2 Lease Charges  — charge-code summary + full charge register
+      P2 RI Policies    — tcode coverage + full policy register
+      P2 Demographics   — field-by-field coverage analysis + full demo register
+
+    All sheets use the same colour palette as the Phase 1 workbook so the
+    document looks consistent.  The workbook is saved back to wb_path.
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from datetime import datetime as _dt
+    from collections import defaultdict
+
+    # ── palette ───────────────────────────────────────────────────────────────
+    DARK_BLUE   = "1F4E79"
+    MID_BLUE    = "2E75B6"
+    LIGHT_BLUE  = "BDD7EE"
+    GREEN       = "375623"
+    LIGHT_GREEN = "E2EFDA"
+    ORANGE      = "C65911"
+    LIGHT_ORG   = "FCE4D6"
+    RED         = "C00000"
+    LIGHT_RED   = "FFDBE0"
+    GREY        = "F2F2F2"
+    PURPLE      = "7030A0"
+    LIGHT_PURP  = "EAD1DC"
+    WHITE       = "FFFFFF"
+
+    def _fill(h):
+        return PatternFill("solid", start_color=h, fgColor=h)
+
+    def _border():
+        s = Side(style="thin", color="BFBFBF")
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    def _hf(bold=True, colour=WHITE, sz=9):
+        return Font(name="Calibri", bold=bold, color=colour, size=sz)
+
+    def _df(bold=False, colour="000000", sz=9, italic=False):
+        return Font(name="Calibri", bold=bold, color=colour, size=sz, italic=italic)
+
+    def _set_widths(ws, widths):
+        for ci, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+
+    def _title(ws, text, span, row=1, bg=DARK_BLUE):
+        ws.merge_cells(f"A{row}:{get_column_letter(span)}{row}")
+        c = ws.cell(row, 1, text)
+        c.font      = Font(name="Calibri", bold=True, color=WHITE, size=11)
+        c.fill      = _fill(bg)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[row].height = 24
+
+    def _subtitle(ws, text, span, row=2):
+        ws.merge_cells(f"A{row}:{get_column_letter(span)}{row}")
+        c = ws.cell(row, 1, text)
+        c.font      = Font(name="Calibri", italic=True, size=9, color="595959")
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row].height = 14
+
+    def _section(ws, row, text, ncols, bg=MID_BLUE):
+        ws.merge_cells(f"A{row}:{get_column_letter(ncols)}{row}")
+        c = ws.cell(row, 1, text)
+        c.font      = _hf(sz=9)
+        c.fill      = _fill(bg)
+        c.border    = _border()
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row].height = 16
+
+    def _hdr_row(ws, row, headers, bg=DARK_BLUE):
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(row, ci, h)
+            c.font      = _hf()
+            c.fill      = _fill(bg)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border    = _border()
+        ws.row_dimensions[row].height = 20
+
+    def _data(ws, r, c, val, bg=WHITE, bold=False, col="000000",
+              italic=False, center=False):
+        cell = ws.cell(r, c, val)
+        cell.font      = _df(bold=bold, colour=col, italic=italic)
+        if bg != WHITE:
+            cell.fill  = _fill(bg)
+        cell.border    = _border()
+        cell.alignment = Alignment(
+            horizontal="center" if center else "left",
+            vertical="center", wrap_text=True)
+        return cell
+
+    def _data_row(ws, row, values, bg=WHITE, bolds=None):
+        for ci, v in enumerate(values, 1):
+            bold = bolds[ci-1] if bolds else False
+            _data(ws, row, ci, v, bg=bg, bold=bold)
+
+    wb  = load_workbook(wb_path)
+    ts  = _dt.now().strftime("%Y-%m-%d %H:%M")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SHEET — P2 LEASE CHARGES
+    # ══════════════════════════════════════════════════════════════════════════
+    ws_lc = wb.create_sheet("P2 Lease Charges")
+    NCOLS_LC = 7   # summary table width
+
+    _title(ws_lc, "Phase 2 · ETL_ResLeaseCharges — Lease Charge Summary", NCOLS_LC, row=1)
+    _subtitle(ws_lc, f"Property: {property_code}  ·  Generated: {ts}  ·  Total charge rows: {len(lc_rows)}", NCOLS_LC, row=2)
+
+    # ── Coverage banner ───────────────────────────────────────────────────────
+    TC_IDX  = lc_cols.index("Tenant_Code")
+    CHG_IDX = lc_cols.index("Charge_Code")
+    AMT_IDX = lc_cols.index("Amount")
+
+    matched_lc  = sum(1 for r in lc_rows if r[TC_IDX])
+    unmatched_lc = len(lc_rows) - matched_lc
+
+    row = 4
+    _section(ws_lc, row, "TCODE COVERAGE", NCOLS_LC); row += 1
+    _hdr_row(ws_lc, row, ["Metric", "Count"], bg=MID_BLUE); row += 1
+    for label, val, bg in [
+        ("Total charge rows",          len(lc_rows),    WHITE),
+        ("Rows with real Tenant_Code", matched_lc,      LIGHT_GREEN if unmatched_lc == 0 else LIGHT_BLUE),
+        ("Rows with blank Tenant_Code (unmatched)", unmatched_lc, WHITE if unmatched_lc == 0 else LIGHT_RED),
+    ]:
+        _data(ws_lc, row, 1, label, bg=bg)
+        _data(ws_lc, row, 2, val,   bg=bg, bold=True, center=True)
+        row += 1
+
+    # ── Charge code summary ───────────────────────────────────────────────────
+    row += 1
+    _section(ws_lc, row, "CHARGE CODE SUMMARY", NCOLS_LC); row += 1
+    _hdr_row(ws_lc, row,
+             ["Charge Code", "# Rows", "Total Amount ($)", "Distinct Tenants",
+              "Min Charge ($)", "Max Charge ($)", "Avg Charge ($)"],
+             bg=DARK_BLUE)
+    row += 1
+
+    code_data = defaultdict(lambda: {"rows": 0, "total": 0.0, "tenants": set(), "amounts": []})
+    for r in lc_rows:
+        code = r[CHG_IDX] or "—"
+        amt  = float(r[AMT_IDX] or 0)
+        code_data[code]["rows"]    += 1
+        code_data[code]["total"]   += amt
+        code_data[code]["tenants"].add(r[TC_IDX])
+        code_data[code]["amounts"].append(amt)
+
+    alt = False
+    for code in sorted(code_data.keys()):
+        d   = code_data[code]
+        bg  = GREY if alt else WHITE
+        alt = not alt
+        amounts = d["amounts"]
+        _data_row(ws_lc, row, [
+            code,
+            d["rows"],
+            round(d["total"], 2),
+            len(d["tenants"]),
+            round(min(amounts), 2),
+            round(max(amounts), 2),
+            round(d["total"] / len(amounts), 2) if amounts else 0,
+        ], bg=bg)
+        row += 1
+
+    # ── Full charge register ──────────────────────────────────────────────────
+    row += 1
+    display_cols_lc = ["Property_Code", "Tenant_Code", "From_Date",
+                        "Charge_Code", "Amount", "RentableItemType_Code"]
+    _section(ws_lc, row, f"FULL CHARGE REGISTER  ({len(lc_rows)} rows)", NCOLS_LC); row += 1
+    _hdr_row(ws_lc, row, display_cols_lc + ["Notes"], bg=DARK_BLUE); row += 1
+
+    col_idx_map_lc = {c: lc_cols.index(c) for c in display_cols_lc if c in lc_cols}
+    alt = False
+    for r in lc_rows:
+        bg  = GREY if alt else WHITE
+        alt = not alt
+        tc  = r[TC_IDX]
+        if not tc:
+            bg = LIGHT_RED
+        row_vals = [r[col_idx_map_lc[c]] if c in col_idx_map_lc else None
+                    for c in display_cols_lc]
+        note = "⚠ No tcode" if not tc else ""
+        _data_row(ws_lc, row, row_vals + [note], bg=bg)
+        row += 1
+
+    _set_widths(ws_lc, [14, 16, 12, 12, 12, 18, 14])
+    ws_lc.freeze_panes = "A4"
+    ws_lc.auto_filter.ref = f"A{row - len(lc_rows)}:G{row - 1}"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SHEET — P2 RI POLICIES
+    # ══════════════════════════════════════════════════════════════════════════
+    ws_ri = wb.create_sheet("P2 RI Policies")
+    NCOLS_RI = 8
+
+    _title(ws_ri, "Phase 2 · ETL_RIPolicies — Renters Insurance Policy Summary", NCOLS_RI, row=1)
+    _subtitle(ws_ri, f"Property: {property_code}  ·  Generated: {ts}  ·  Total policies: {len(ri_rows)}", NCOLS_RI, row=2)
+
+    # Column indices for RI
+    # cols = Policy_Number, Insurer_Name, Liability_Amount, Effective_Date,
+    #        Expired_Date, Cancel_Date, Tenant_Code, Unit_Number, First_Name, Last_Name, Tenant_Code1
+    TC_RI_IDX  = ri_cols.index("Tenant_Code")
+    PN_IDX     = ri_cols.index("Policy_Number")
+    INS_IDX    = ri_cols.index("Insurer_Name")
+    EFF_IDX    = ri_cols.index("Effective_Date")
+    EXP_IDX    = ri_cols.index("Expired_Date")
+
+    matched_ri   = sum(1 for r in ri_rows if r[TC_RI_IDX])
+    unmatched_ri = len(ri_rows) - matched_ri
+    missing_pol  = sum(1 for r in ri_rows if not r[PN_IDX])
+
+    row = 4
+    _section(ws_ri, row, "COVERAGE SUMMARY", NCOLS_RI); row += 1
+    _hdr_row(ws_ri, row, ["Metric", "Count", "Status"], bg=MID_BLUE); row += 1
+    for label, val, ok in [
+        ("Total policies",                     len(ri_rows),    None),
+        ("Policies with real Tenant_Code",     matched_ri,      unmatched_ri == 0),
+        ("Policies with blank Tenant_Code",    unmatched_ri,    unmatched_ri == 0),
+        ("Policies missing Policy_Number",     missing_pol,     missing_pol == 0),
+        ("Unique carriers",                    len({r[INS_IDX] for r in ri_rows if r[INS_IDX]}), None),
+    ]:
+        if ok is None:
+            bg = WHITE
+            status = "—"
+        else:
+            bg = LIGHT_GREEN if ok else LIGHT_RED
+            status = "✓ OK" if ok else f"⚠ {val} issue(s)"
+        _data(ws_ri, row, 1, label,  bg=bg)
+        _data(ws_ri, row, 2, val,    bg=bg, bold=True, center=True)
+        _data(ws_ri, row, 3, status, bg=bg, bold=True,
+              col=GREEN if ok else (RED if ok is False else "000000"), center=True)
+        row += 1
+
+    # ── Carrier breakdown ─────────────────────────────────────────────────────
+    row += 1
+    _section(ws_ri, row, "CARRIER BREAKDOWN", NCOLS_RI); row += 1
+    _hdr_row(ws_ri, row, ["Carrier", "Policy Count"], bg=DARK_BLUE); row += 1
+
+    carrier_counts = defaultdict(int)
+    for r in ri_rows:
+        carrier_counts[r[INS_IDX] or "Unknown"] += 1
+
+    alt = False
+    for carrier, cnt in sorted(carrier_counts.items(), key=lambda x: -x[1]):
+        bg  = GREY if alt else WHITE
+        alt = not alt
+        _data(ws_ri, row, 1, carrier, bg=bg)
+        _data(ws_ri, row, 2, cnt,     bg=bg, bold=True, center=True)
+        row += 1
+
+    # ── Full policy register ──────────────────────────────────────────────────
+    row += 1
+    _section(ws_ri, row, f"FULL POLICY REGISTER  ({len(ri_rows)} policies)", NCOLS_RI); row += 1
+    _hdr_row(ws_ri, row,
+             ["Policy_Number", "Carrier", "Tenant_Code", "Effective_Date",
+              "Expired_Date", "Liability_Amount", "Tenant_Code1", "Notes"],
+             bg=DARK_BLUE)
+    row += 1
+
+    alt = False
+    for r in ri_rows:
+        tc  = r[TC_RI_IDX]
+        bg  = LIGHT_RED if not tc else (GREY if alt else WHITE)
+        alt = not alt
+        note = "⚠ No tcode" if not tc else ("⚠ No policy #" if not r[PN_IDX] else "")
+        _data_row(ws_ri, row, [
+            r[PN_IDX],
+            r[INS_IDX],
+            tc,
+            r[EFF_IDX],
+            r[EXP_IDX],
+            r[ri_cols.index("Liability_Amount")] if "Liability_Amount" in ri_cols else 100000,
+            r[ri_cols.index("Tenant_Code1")]      if "Tenant_Code1"    in ri_cols else tc,
+            note,
+        ], bg=bg)
+        row += 1
+
+    _set_widths(ws_ri, [18, 24, 16, 14, 14, 16, 16, 16])
+    ws_ri.freeze_panes = "A4"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SHEET — P2 Demographics
+    # ══════════════════════════════════════════════════════════════════════════
+    ws_dm = wb.create_sheet("P2 Demographics")
+    NCOLS_DM = 6
+
+    _title(ws_dm, "Phase 2 · ETL_leasebut_demo — Demographic Data Coverage", NCOLS_DM, row=1)
+    _subtitle(ws_dm, f"Property: {property_code}  ·  Generated: {ts}  ·  Total records: {len(demo_rows)}", NCOLS_DM, row=2)
+
+    # Column indices for demo
+    # cols = TableName, HCODE, demo_tcode, Unnamed:3, demo_name, Unnamed:5,
+    #        SCODE, SNAME, demo_lease_role, demo_birthdate, demo_employer,
+    #        demo_job_title, demo_annual_salary, demo_emp_zip_code, demo_cur_res_type,
+    #        demo_move_reason, demo_prior_zip, demo_dist_work, demo_cnt_vehicles,
+    #        demo_cnt_pet, demo_gender, demo_marital_status
+    DTC_IDX  = demo_cols.index("demo_tcode")   if "demo_tcode"   in demo_cols else 2
+    DNAME_IDX= demo_cols.index("demo_name")    if "demo_name"    in demo_cols else 4
+
+    n_total_dm  = len(demo_rows)
+    matched_dm  = sum(1 for r in demo_rows if r[DTC_IDX])
+    unmatched_dm = n_total_dm - matched_dm
+
+    row = 4
+    _section(ws_dm, row, "TCODE COVERAGE", NCOLS_DM); row += 1
+    _hdr_row(ws_dm, row, ["Metric", "Count", "Status"], bg=MID_BLUE); row += 1
+    for label, val, ok in [
+        ("Total demographic records",          n_total_dm,    None),
+        ("Records with real demo_tcode",       matched_dm,    unmatched_dm == 0),
+        ("Records with blank demo_tcode",      unmatched_dm,  unmatched_dm == 0),
+    ]:
+        bg = WHITE if ok is None else (LIGHT_GREEN if ok else LIGHT_RED)
+        status = "—" if ok is None else ("✓ OK" if ok else f"⚠ {val} unmatched")
+        _data(ws_dm, row, 1, label,  bg=bg)
+        _data(ws_dm, row, 2, val,    bg=bg, bold=True, center=True)
+        _data(ws_dm, row, 3, status, bg=bg, bold=True,
+              col=GREEN if ok else (RED if ok is False else "000000"), center=True)
+        row += 1
+
+    # ── Field coverage analysis ───────────────────────────────────────────────
+    row += 1
+    _section(ws_dm, row, "FIELD COVERAGE ANALYSIS", NCOLS_DM); row += 1
+    _hdr_row(ws_dm, row,
+             ["Field", "Populated", "Blank", "Coverage %", "Source", "Notes"],
+             bg=DARK_BLUE)
+    row += 1
+
+    # Fields to analyse: (display_name, col_name_or_idx, source, note)
+    field_defs = [
+        ("demo_tcode",          "demo_tcode",          "Yardi export (Phase 2)",     "Tcode assigned by Yardi"),
+        ("demo_name",           "demo_name",           "Rent Roll",                  "Always populated"),
+        ("demo_lease_role",     "demo_lease_role",     "Static",                     "Always 'Head of household'"),
+        ("demo_birthdate",      "demo_birthdate",      "Not available",              "Always blank — not in OneSite exports"),
+        ("demo_employer",       "demo_employer",       "Contract Level Detail",      "Sparsely populated"),
+        ("demo_job_title",      "demo_job_title",      "Contract Level Detail",      "Sparsely populated"),
+        ("demo_annual_salary",  "demo_annual_salary",  "Contract Level Detail",      "Sparsely populated"),
+        ("demo_gender",         "demo_gender",         "Contract Level Detail",      "Sparsely populated"),
+        ("demo_marital_status", "demo_marital_status", "Contract Level Detail",      "Sparsely populated"),
+    ]
+
+    alt = False
+    for display, col_name, source, note in field_defs:
+        try:
+            ci = demo_cols.index(col_name)
+        except ValueError:
+            ci = None
+        if ci is not None:
+            populated = sum(1 for r in demo_rows if r[ci] is not None and str(r[ci]).strip() not in ("", "None"))
+        else:
+            populated = 0
+        blank = n_total_dm - populated
+        pct   = f"{populated/n_total_dm*100:.0f}%" if n_total_dm else "—"
+
+        if populated == 0:
+            bg_row = LIGHT_RED
+        elif populated == n_total_dm:
+            bg_row = LIGHT_GREEN
+        elif populated > n_total_dm * 0.5:
+            bg_row = LIGHT_BLUE
+        else:
+            bg_row = LIGHT_ORG
+        alt = not alt
+
+        _data_row(ws_dm, row, [display, populated, blank, pct, source, note], bg=bg_row)
+        row += 1
+
+    # ── Full demographic register ─────────────────────────────────────────────
+    row += 1
+    _section(ws_dm, row, f"FULL DEMOGRAPHIC REGISTER  ({n_total_dm} records)", NCOLS_DM); row += 1
+
+    display_cols_dm = ["HCODE", "demo_tcode", "demo_name", "demo_lease_role",
+                        "demo_employer", "demo_job_title", "demo_annual_salary",
+                        "demo_gender", "demo_marital_status"]
+    _hdr_row(ws_dm, row, display_cols_dm + ["Notes"], bg=DARK_BLUE); row += 1
+
+    col_map_dm = {}
+    for c in display_cols_dm:
+        try:
+            col_map_dm[c] = demo_cols.index(c)
+        except ValueError:
+            col_map_dm[c] = None
+
+    alt = False
+    for r in demo_rows:
+        tc  = r[DTC_IDX]
+        bg  = LIGHT_RED if not tc else (GREY if alt else WHITE)
+        alt = not alt
+        row_vals = []
+        for c in display_cols_dm:
+            ci = col_map_dm[c]
+            row_vals.append(r[ci] if ci is not None else None)
+        note = "⚠ No tcode" if not tc else ""
+        _data_row(ws_dm, row, row_vals + [note], bg=bg)
+        row += 1
+
+    _set_widths(ws_dm, [10, 16, 24, 18, 24, 22, 16, 12, 16, 14])
+    ws_dm.freeze_panes = "A4"
+
+    wb.save(wb_path)
+    return wb_path

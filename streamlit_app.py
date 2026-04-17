@@ -44,6 +44,7 @@ DEFAULTS = {
     "tenants": None,      # serialised from Phase 1, used in Phase 2
     "phase1_zip": None,
     "phase2_zip": None,
+    "phase2_validation_xlsx": None,   # updated validation workbook with Phase 2 tabs
     "tmp_dirs": [],
 }
 for k, v in DEFAULTS.items():
@@ -717,9 +718,30 @@ elif st.session_state.step == 5:
             from converter import run_phase2
             tmp_out = tempfile.mkdtemp()
             st.session_state.tmp_dirs.append(tmp_out)
-            gen2, zip2 = run_phase2(base, tmp_out, m, pc, tenants, tcode_map, progress_cb=cb)
+
+            # Write the existing Phase 1 validation workbook to disk so
+            # run_phase2 can append the three Phase 2 summary tabs to it.
+            val_wb_path = None
+            val_bytes   = st.session_state.get("validation_xlsx")
+            if val_bytes:
+                val_wb_path = os.path.join(tmp_out, f"{pc}_Validation_Report.xlsx")
+                with open(val_wb_path, "wb") as f:
+                    f.write(val_bytes)
+
+            gen2, zip2 = run_phase2(
+                base, tmp_out, m, pc, tenants, tcode_map,
+                progress_cb=cb,
+                val_workbook_path=val_wb_path,
+            )
             pbar.progress(100); log_el.code("\n".join(msgs))
-            with open(zip2,"rb") as f: st.session_state.phase2_zip = f.read()
+            with open(zip2, "rb") as f:
+                st.session_state.phase2_zip = f.read()
+
+            # Read back the updated validation workbook (now has P2 tabs)
+            if val_wb_path and os.path.exists(val_wb_path):
+                with open(val_wb_path, "rb") as f:
+                    st.session_state.phase2_validation_xlsx = f.read()
+
             st.rerun()
         except Exception as e:
             import traceback
@@ -729,13 +751,31 @@ elif st.session_state.step == 5:
         st.success("All tcode-dependent ETL files generated with real Yardi tenant codes.")
         st.markdown("")
 
-        st.download_button(
-            "⬇ Download Phase 2 ETL Package (.zip)",
-            data=st.session_state.phase2_zip,
-            file_name=f"{pc}_Phase2_ETL.zip",
-            mime="application/zip",
-            use_container_width=True,
-        )
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            st.markdown("**📦 Phase 2 ETL Files**")
+            st.caption("Tcode-dependent files with real Yardi tenant codes — import these into Yardi")
+            st.download_button(
+                "⬇ Download Phase 2 ETL Package (.zip)",
+                data=st.session_state.phase2_zip,
+                file_name=f"{pc}_Phase2_ETL.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        with col_dl2:
+            st.markdown("**📊 Updated Validation Report**")
+            st.caption("Full workbook — Phase 1 mapping + Phase 2 charge, insurance & demographic summaries")
+            p2_val = st.session_state.get("phase2_validation_xlsx")
+            if p2_val:
+                st.download_button(
+                    "⬇ Download Updated Validation_Report.xlsx",
+                    data=p2_val,
+                    file_name=f"{pc}_Validation_Report_Phase2.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            else:
+                st.info("Validation report not available — Phase 1 report may not have been generated in this session.", icon="ℹ️")
 
         st.markdown("---")
         st.markdown("""
@@ -747,6 +787,13 @@ elif st.session_state.step == 5:
 | ETL_ResLeaseCharges | Tenant_Code |
 | ETL_ResManageRentableItems | Tenant_Code |
 | ETL_leasebut_demo | demo_tcode |
+
+**Updated Validation Report includes:**
+| Sheet | Contents |
+|---|---|
+| P2 Lease Charges | Charge-code summary, tcode coverage, full charge register |
+| P2 RI Policies | Carrier breakdown, tcode coverage, full policy register |
+| P2 Demographics | Field-by-field coverage analysis, full demographic register |
 """)
         st.markdown("")
         if st.button("↩ Convert Another Property"): reset()
