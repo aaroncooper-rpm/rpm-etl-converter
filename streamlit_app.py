@@ -542,10 +542,19 @@ elif st.session_state.step == 3:
             with open(zip1,"rb") as f: st.session_state.phase1_zip = f.read()
             st.session_state.tenants = tenants
 
-            # Build validation workbook from vdata already in session
+            # Build validation workbook — pass rent roll + rentable items so
+            # the mapping tabs (Field Mapping, Lease Charges, Rentable Items,
+            # Takeover Guide Ref) are populated with actual runtime data.
             cb("📊 Building validation workbook...")
             val_path = os.path.join(tmp_out, f"{pc}_Validation_Report.xlsx")
-            build_validation_workbook(st.session_state.vdata, m, pc, tenants, val_path)
+            from converter import load_rent_roll, load_rentable_items
+            rr_map         = load_rent_roll(base)       # cached — no extra I/O
+            rent_items_map = load_rentable_items(base)  # cached — no extra I/O
+            build_validation_workbook(
+                st.session_state.vdata, m, pc, tenants, val_path,
+                rr=rr_map,
+                rent_items=rent_items_map,
+            )
             with open(val_path, "rb") as f:
                 st.session_state.validation_xlsx = f.read()
             cb("   ✅ Validation_Report.xlsx")

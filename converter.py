@@ -1299,16 +1299,677 @@ def run_phase2(base, output_dir, mappings, property_code,
 
 # ─────────────────── VALIDATION WORKBOOK ─────────────────────────────────────
 
-def build_validation_workbook(vdata, mappings, property_code, tenants, output_path):
+def _add_mapping_tabs(wb, vdata, mappings, tenants, rr=None, rent_items=None):
+    """
+    Add runtime data-mapping reference tabs to an existing openpyxl Workbook.
+
+    New sheets added:
+      7. Field Mapping      — every ETL column with source file, logic, actual coverage
+                              % and a sample value drawn from the live dataset.
+      8. Lease Charges      — one row per non-zero charge per tenant (from rent roll).
+      9. Rentable Items     — individual item records with unit assignment and status.
+     10. Takeover Guide Ref — formatted dump of every mapping read from the guide.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    # ── palette (mirrors the existing workbook) ───────────────────────────────
+    NAVY        = "1F3864"
+    DARK_BLUE   = "1F4E79"
+    MID_BLUE    = "2E75B6"
+    LIGHT_BLUE  = "BDD7EE"
+    TEAL        = "17375E"
+    GREEN       = "375623"
+    LIGHT_GREEN = "E2EFDA"
+    ORANGE      = "C65911"
+    LIGHT_ORG   = "FCE4D6"
+    RED         = "C00000"
+    LIGHT_RED   = "FFDBE0"
+    PURPLE      = "7030A0"
+    LIGHT_PURP  = "EAD1DC"
+    YELLOW      = "FFF2CC"
+    GREY        = "F2F2F2"
+    WHITE       = "FFFFFF"
+
+    def _fill(hex_c):
+        return PatternFill("solid", start_color=hex_c, fgColor=hex_c)
+
+    def _border():
+        s = Side(style="thin", color="BFBFBF")
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    def _hf(bold=True, colour=WHITE, sz=9):
+        return Font(name="Calibri", bold=bold, color=colour, size=sz)
+
+    def _df(bold=False, colour="000000", sz=9, italic=False):
+        return Font(name="Calibri", bold=bold, color=colour, size=sz, italic=italic)
+
+    def _set_widths(ws, widths):
+        for ci, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+
+    def _title_row(ws, text, span, row=1, bg=NAVY):
+        ws.merge_cells(f"A{row}:{get_column_letter(span)}{row}")
+        c = ws.cell(row, 1, text)
+        c.font = Font(name="Calibri", bold=True, color=WHITE, size=11)
+        c.fill = _fill(bg)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[row].height = 26
+
+    def _header_row(ws, row_num, headers, bg=DARK_BLUE):
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(row_num, ci, h)
+            c.font = _hf()
+            c.fill = _fill(bg)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = _border()
+        ws.row_dimensions[row_num].height = 22
+
+    def _data_cell(ws, r, c, val, bg=WHITE, bold=False, colour="000000",
+                   italic=False, center=False, wrap=True):
+        cell = ws.cell(r, c, val)
+        cell.font = _df(bold=bold, colour=colour, italic=italic)
+        if bg != WHITE:
+            cell.fill = _fill(bg)
+        cell.border = _border()
+        cell.alignment = Alignment(
+            horizontal="center" if center else "left",
+            vertical="center", wrap_text=wrap)
+        return cell
+
+    def _section_row(ws, row_num, text, ncols, bg=MID_BLUE):
+        ws.merge_cells(f"A{row_num}:{get_column_letter(ncols)}{row_num}")
+        c = ws.cell(row_num, 1, text)
+        c.font = _hf(sz=9)
+        c.fill = _fill(bg)
+        c.border = _border()
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row_num].height = 16
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PRE-COMPUTE coverage stats from live tenants dict
+    # ══════════════════════════════════════════════════════════════════════════
+    t_vals   = list(tenants.values())
+    n_total  = len(t_vals)
+
+    def _cov(fn):
+        """Return (count_with_data, pct_str, sample_str)."""
+        hits = [t for t in t_vals if fn(t)]
+        pct  = f"{len(hits)/n_total*100:.0f}%" if n_total else "—"
+        # pick a sample from the first hit
+        samples = []
+        for t in hits:
+            v = fn(t)
+            s = str(v).strip() if v else ""
+            if s and s.lower() not in ("none","nan","") and s not in samples:
+                samples.append(s)
+            if len(samples) >= 2:
+                break
+        sample = samples[0] if samples else "—"
+        return len(hits), pct, sample
+
+    n_current = sum(1 for t in t_vals if t["status"] == 0)
+    n_notice  = sum(1 for t in t_vals if t["status"] == 4)
+    n_future  = sum(1 for t in t_vals if t["status"] == 6)
+    n_evict   = sum(1 for t in t_vals if t["status"] == 10)
+    n_fbal    = sum(1 for t in t_vals if t["status"] == 5)
+
+    STATUS_LABEL = {0:"Current",4:"Notice",6:"Future",10:"Eviction",5:"Former/Bal"}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 7 — SOURCE → ETL FIELD MAPPING
+    # ══════════════════════════════════════════════════════════════════════════
+    ws7 = wb.create_sheet("Field Mapping")
+    ws7.sheet_view.showGridLines = False
+    ws7.sheet_properties.tabColor = "1F4E79"
+
+    HDR7 = ["ETL Output File(s)", "ETL Column", "Phase",
+            "Source File", "Source Column / Logic",
+            "Records w/ Data", "Coverage %", "Sample Value", "Notes"]
+    NCOLS7 = len(HDR7)
+
+    _title_row(ws7, f"RPM Living  ·  Source → ETL Field Mapping  ·  {mappings.get('prop_name','')}  ·  #{property_code}",
+               NCOLS7, row=1)
+    _header_row(ws7, 2, HDR7)
+    ws7.freeze_panes = "A3"
+
+    # ── Field definitions ────────────────────────────────────────────────────
+    # Each entry: (section|None, etl_files, etl_col, phase, src_file, src_logic, cov_fn_or_None, notes)
+    TENANT_FILES = "ETL_ResTenants / _Notice / _Future / _Eviction / _FormerBal"
+
+    def _static(val):
+        """Coverage fn for static (always-populated) fields."""
+        return lambda t: val
+
+    field_defs = [
+        # ─── Tenant Identity
+        ("── Tenant Identity & Property",),
+        (TENANT_FILES, "Property_Code",    1,
+         "User Input",         "Entered on upload screen",
+         lambda t: property_code,  ""),
+        (TENANT_FILES, "Unit_Code",        1,
+         "Rent Roll Detail",   "Bldg/Unit — zero-padded to 4 digits",
+         lambda t: t.get("unit_code"),  ""),
+        (TENANT_FILES, "Status",           1,
+         "Rent Roll + Lease Details", "0/4/6/10/5 — eviction flag takes precedence",
+         lambda t: STATUS_LABEL.get(t.get("status")),  "Controls which ETL file tenant appears in"),
+        (TENANT_FILES, "Tenant_Code",      2,
+         "Yardi Export",       "Blank in Phase 1 — populated from Yardi export in Phase 2",
+         None,  "Matching key: Unit_Code + Last_Name"),
+        # ─── Name
+        ("── Name Parsing (Rent Roll — Last, First format)",),
+        (TENANT_FILES, "Last_Name",        1,
+         "Rent Roll Detail",   "Name column — split on first comma",
+         lambda t: t.get("last_name"),  "Corporate names passed through unparsed"),
+        (TENANT_FILES, "First_Name",       1,
+         "Rent Roll Detail",   "Name column — first token after comma",
+         lambda t: t.get("first_name"),  ""),
+        (TENANT_FILES, "Middle_Name",      1,
+         "Rent Roll Detail",   "Third token after comma split (if present)",
+         lambda t: t.get("middle_name"),  "Sparsely populated"),
+        # ─── Dates
+        ("── Lease & Move Dates",),
+        (TENANT_FILES, "Move_In_Date",     1,
+         "Rent Roll Detail",   "Move-In column",
+         lambda t: t.get("move_in"),  ""),
+        (TENANT_FILES, "Move_Out_Date",    1,
+         "Rent Roll / Lease Details", "Move-Out (RR primary); Scheduled move out (LD fallback)",
+         lambda t: t.get("move_out"),  "Blank for current residents without NTV"),
+        (TENANT_FILES, "Notice_Date",      1,
+         "Lease Details / Rent Roll", "Notice given date (LD primary); RR Move-Out for status 4",
+         lambda t: t.get("notice_date"),  "Status 4 records only"),
+        (TENANT_FILES, "Lease_From_Date",  1,
+         "Rent Roll Detail",   "Lease Start column",
+         lambda t: t.get("lease_from"),  ""),
+        (TENANT_FILES, "Lease_To_Date",    1,
+         "Rent Roll Detail",   "Lease End column",
+         lambda t: t.get("lease_to"),  ""),
+        (TENANT_FILES, "Lease_Sign_Date",  1,
+         "Lease Details",      "Lease signed date column",
+         lambda t: t.get("lease_sign"),  "Flagged in Quality Flags if missing"),
+        (TENANT_FILES, "LeaseTerm",        1,
+         "Lease Details",      "Lease term (months) — defaults to 12 if not found",
+         lambda t: t.get("lease_term"),  ""),
+        # ─── Phone
+        ("── Contact — Phone (multi-source fallback chain)",),
+        (TENANT_FILES, "Phone_Number_1",   1,
+         "Lease Details → Contract Level Detail", "Cell Phone — LD primary; CLD fallback",
+         lambda t: t.get("phone1"),  "Flagged if missing"),
+        (TENANT_FILES, "Phone_Number_2",   1,
+         "LD → CLD → Resident Birthdays", "Home Phone — 3-source fallback",
+         lambda t: t.get("phone2"),  ""),
+        (TENANT_FILES, "Phone_Number_3",   1,
+         "Lease Details",      "Work Phone",
+         lambda t: t.get("phone3"),  "Sparsely populated"),
+        (TENANT_FILES, "Phone_Number_4",   1,
+         "— Not Available",    "Always blank — OneSite exports only 3 phones",
+         None,  "Known limitation"),
+        # ─── Email & Address
+        ("── Contact — Email & Address",),
+        (TENANT_FILES, "Email",            1,
+         "Contract Level Detail → Resident Birthdays", "E-mail — 2-source fallback chain",
+         lambda t: t.get("email"),  "Flagged in Quality Flags if missing"),
+        (TENANT_FILES, "Address1",         1,
+         "LD → CLD → Takeover Guide", "Forwarding/Billing address — 4-source fallback ending in property address",
+         lambda t: t.get("address1"),  ""),
+        (TENANT_FILES, "City",             1,
+         "LD → Takeover Guide", "Parsed from address; property city as final fallback",
+         lambda t: t.get("city"),  ""),
+        (TENANT_FILES, "State",            1,
+         "LD → Takeover Guide", "Parsed from address; property state as final fallback",
+         lambda t: t.get("state"),  ""),
+        (TENANT_FILES, "Zipcode",          1,
+         "LD → Takeover Guide", "Parsed from address; property zip as final fallback",
+         lambda t: t.get("zipcode"),  ""),
+        (TENANT_FILES, "Address2",         1,
+         "— Not Available",    "Always blank",
+         None,  "Known limitation"),
+        # ─── Financials
+        ("── Financials",),
+        (TENANT_FILES, "Rent",             1,
+         "Rent Roll Detail",   "Lease Rent column",
+         lambda t: t.get("rent"),  ""),
+        (TENANT_FILES, "Security_Deposit_0", 1,
+         "Rent Roll Detail",   "Required Deposit column",
+         lambda t: t.get("deposit"),  ""),
+        # ─── Not available
+        ("── Fields Not Available in OneSite Exports",),
+        (TENANT_FILES, "Date_of_Birth",    1,
+         "— Not Available",    "Not exported from OneSite — always blank",
+         None,  "OneSite design limitation"),
+        (TENANT_FILES, "Social_Security_Number", 1,
+         "— Not Available",    "Intentionally not exported — always blank",
+         None,  "Privacy — excluded from all OneSite exports"),
+        # ─── Roommates
+        ("── ETL_ResRoommates  (Phase 2)",),
+        ("ETL_ResRoommates", "Tenant_Code",      2,
+         "Yardi Export",       "Primary leaseholder tcode — matched by Unit + Last_Name",
+         None,  ""),
+        ("ETL_ResRoommates", "Unit_Code",         2,
+         "All Residents",      "Bldg/Unit — zero-padded",
+         None,  ""),
+        ("ETL_ResRoommates", "Roommate_LastName", 2,
+         "All Residents",      "Secondary occupant Name — before comma",
+         None,  ""),
+        ("ETL_ResRoommates", "Roommate_FirstName",2,
+         "All Residents",      "Secondary occupant Name — after comma",
+         None,  ""),
+        ("ETL_ResRoommates", "Roommate_PhoneNumber1",2,
+         "All Residents",      "Phone column for secondary occupant",
+         None,  ""),
+        ("ETL_ResRoommates", "Roommate_MoveIn",   2,
+         "All Residents",      "Move In date for secondary occupant",
+         None,  ""),
+        ("ETL_ResRoommates", "Roommate_MoveOut",  2,
+         "All Residents",      "Move Out date (blank for current occupants)",
+         None,  ""),
+        ("ETL_ResRoommates", "Roommate_Code",     2,
+         "Derived",            "Auto-generated: 'rr' + unit_code + sequence (e.g. rr01171)",
+         None,  ""),
+        ("ETL_ResRoommates", "Occupant_Type / Roommate_Occupant / Roommate_ACHOptOut", 2,
+         "Static",             "Always 1 / 0 / 0 respectively",
+         None,  "Hardcoded"),
+        ("ETL_ResRoommates", "Roommate_Relationship", 2,
+         "Static",             "Always 'Roommate'",
+         None,  "Hardcoded"),
+        # ─── RI Policies
+        ("── ETL_RIPolicies  (Phase 2)",),
+        ("ETL_RIPolicies", "Policy_Number",    2,
+         "Renters Insurance Status Report", "Policy # column",
+         None,  ""),
+        ("ETL_RIPolicies", "Insurer_Name",     2,
+         "Renters Insurance Status Report", "Carrier column",
+         None,  ""),
+        ("ETL_RIPolicies", "Effective_Date",   2,
+         "Renters Insurance Status Report", "Policy Start Date",
+         None,  ""),
+        ("ETL_RIPolicies", "Expired_Date",     2,
+         "Renters Insurance Status Report", "Expiration Date",
+         None,  ""),
+        ("ETL_RIPolicies", "Cancel_Date",      2,
+         "— Not Available",   "Always blank — not in RI report",
+         None,  "Known limitation"),
+        ("ETL_RIPolicies", "Tenant_Code / Tenant_Code1", 2,
+         "Yardi Export",      "Primary leaseholder tcode — Tenant_Code1 = duplicate of Tenant_Code (Yardi requirement)",
+         None,  ""),
+        ("ETL_RIPolicies", "Liability_Amount", 2,
+         "Static",            "Always 100000",
+         None,  "RPM standard"),
+        ("ETL_RIPolicies", "Unit_Number",      2,
+         "Static",            "Always 0",
+         None,  "Yardi requirement"),
+        # ─── Lease Charges
+        ("── ETL_ResLeaseCharges  (Phase 2)",),
+        ("ETL_ResLeaseCharges", "Tenant_Code",  2,
+         "Yardi Export",      "Leaseholder tcode — matched from Yardi export",
+         None,  ""),
+        ("ETL_ResLeaseCharges", "From_Date",    2,
+         "Rent Roll Detail",  "Lease Start date",
+         None,  ""),
+        ("ETL_ResLeaseCharges", "Charge_Code",  2,
+         "Rent Roll Detail",  "Column header → Yardi code  (RENT→rent, INTERNET→internet, Pet Rent→petrent, GARAGE→garagmsc, PETFEE→petfee, RINSUR→rinsur, CABLE→cable)",
+         None,  "One row per non-zero charge per resident"),
+        ("ETL_ResLeaseCharges", "Amount",       2,
+         "Rent Roll Detail",  "Dollar value of charge column — zero-value rows excluded",
+         None,  ""),
+        ("ETL_ResLeaseCharges", "Is_Hold / Is_Taxable / Is_Ach / Is_CreditCard / Max_Month / LateFee", 2,
+         "Static",            "Always 0",
+         None,  "Hardcoded flags"),
+        # ─── Rentable Assignments
+        ("── ETL_ResManageRentableItems  (Phase 2)",),
+        ("ETL_ResManageRentableItems", "Tenant_Code", 2,
+         "Yardi Export",      "Leaseholder tcode",
+         None,  ""),
+        ("ETL_ResManageRentableItems", "RentableItemType_Code", 2,
+         "Takeover Guide",    "Type name — Rentable Item Types sheet",
+         None,  ""),
+        ("ETL_ResManageRentableItems", "RentableItem_Code", 2,
+         "Rentable Items Status", "Number from item name ('Garage 1' → '01')",
+         None,  ""),
+        ("ETL_ResManageRentableItems", "Lease_From", 2,
+         "Rentable Items Status → Rent Roll", "Begin date from RI file; Lease Start as fallback",
+         None,  ""),
+        # ─── Demographics
+        ("── ETL_leasebut_demo  (Phase 2)",),
+        ("ETL_leasebut_demo", "demo_tcode",         2,
+         "Yardi Export",      "Leaseholder tcode",
+         None,  ""),
+        ("ETL_leasebut_demo", "HCODE",              2,
+         "Rent Roll Detail",  "Resh ID — internal reference ID",
+         lambda t: t.get("resh_id"),  ""),
+        ("ETL_leasebut_demo", "demo_name",          2,
+         "Rent Roll Detail",  "Last, First from Name column",
+         lambda t: f"{t['last_name']}, {t['first_name']}" if t.get("last_name") else None,  ""),
+        ("ETL_leasebut_demo", "demo_lease_role",    2,
+         "Static",            "Always 'Head of household'",
+         None,  "Hardcoded"),
+        ("ETL_leasebut_demo", "demo_employer / demo_job_title / demo_annual_salary", 2,
+         "Contract Level Detail", "Current employment fields — sparsely populated",
+         None,  "Many residents will have blank values"),
+        ("ETL_leasebut_demo", "demo_gender / demo_marital_status", 2,
+         "Contract Level Detail", "Personal attributes — sparsely populated",
+         None,  "Many residents will have blank values"),
+        ("ETL_leasebut_demo", "demo_birthdate / demo_emp_zip_code", 2,
+         "— Not Available",   "Always blank — not in source data",
+         None,  "Known limitation"),
+        # ─── Prospects
+        ("── ETL_ResProspects  (Phase 1)",),
+        ("ETL_ResProspects", "Prospect_Code",       1,
+         "Prospect Contact Level Details", "'p' + zero-padded Guest Card ID to 7 digits",
+         None,  ""),
+        ("ETL_ResProspects", "LastName / FirstName / MiddleName", 1,
+         "Prospect Contact Level Details", "Last Name, First Name, Middle Name columns",
+         None,  ""),
+        ("ETL_ResProspects", "HomePhone / CellPhone / Email", 1,
+         "Prospect Contact Level Details", "1st Phone, 2nd Phone, E-mail columns",
+         None,  ""),
+        ("ETL_ResProspects", "Status",              1,
+         "Prospect Contact Level Details", "Active→6, Lost→7, Unqualified→8",
+         None,  ""),
+        ("ETL_ResProspects", "Preferred_Bedrooms / Preferred_Bath", 1,
+         "Prospect CLD + Takeover Guide", "Floor Plan code → beds/baths via unit type map",
+         None,  ""),
+        ("ETL_ResProspects", "Source / Agent / First_Contacted_On", 1,
+         "Prospect Contact Level Details", "Primary advertising source, Leasing Consultant, Original guest card creation date",
+         None,  ""),
+        ("ETL_ResProspects", "FirstContactType",    1,
+         "Static",            "Always 'Other'",
+         None,  "Hardcoded"),
+        # ─── Unit Types & CommUnits
+        ("── ETL_ResUnitTypes + ETL_CommUnits  (Phase 1)",),
+        ("ETL_ResUnitTypes", "UnitType_Code",       1,
+         "Takeover Guide",    "Yardi Code — Unit Type sheet col B",
+         None,  ""),
+        ("ETL_ResUnitTypes", "Beds / Baths / SQFT / Rent", 1,
+         "Takeover Guide",    "Unit Type sheet — Beds, Baths, SQFT, Market Rent columns",
+         None,  ""),
+        ("ETL_CommUnits",    "Unit_Code",            1,
+         "Final All Unit",    "Bldg/Unit — zero-padded",
+         None,  ""),
+        ("ETL_CommUnits",    "Unit_Type",            1,
+         "Final All Unit + Takeover Guide", "Floor plan looked up in unit type map",
+         None,  "Unmapped plans flagged red in Unit Types tab"),
+        ("ETL_CommUnits",    "Address_1 / City / State / Zip_Code", 1,
+         "Takeover Guide",    "Property address + unit number — Property Info sheet",
+         None,  ""),
+        ("ETL_CommUnits",    "Rental_Type / Country / Exclude", 1,
+         "Static",            "Always 'Residential' / 'US' / 0",
+         None,  "Hardcoded"),
+        # ─── Amenities
+        ("── ETL_ResPropertyAmenities + ETL_ResUnitAmenities  (Phase 1)",),
+        ("ETL_ResPropertyAmenities", "Amenity_Code / Description / Current_Charge", 1,
+         "Takeover Guide",    "Property Amenities sheet — RPM Code, Description, Monthly Amount",
+         None,  "Monthly Amount editable in Step 2 before generating"),
+        ("ETL_ResUnitAmenities", "Unit_Code",        1,
+         "Final Unit Setup View", "Unit number column — zero-padded",
+         None,  ""),
+        ("ETL_ResUnitAmenities", "Amenity_Code / Current_Charge", 1,
+         "Unit Setup View + Takeover Guide", "Amenity name matched to Takeover Guide; amount from setup view or guide default",
+         None,  "Auto-derived amenities highlighted in Amenities tab"),
+        # ─── Rentable Definitions
+        ("── ETL_ResRentableItemsTypes + ETL_ResRentableItems  (Phase 1)",),
+        ("ETL_ResRentableItemsTypes", "RentableItemType_Code / Rent", 1,
+         "Takeover Guide",    "Rentable Item Types sheet — type name and market rent",
+         None,  ""),
+        ("ETL_ResRentableItems", "Item_Code / Unit_Code / Rent", 1,
+         "Rentable Items Status", "Item number extracted from name; unit assignment; amount",
+         None,  ""),
+    ]
+
+    ri = 3
+    row_colors = [LIGHT_BLUE, WHITE]
+    for defn in field_defs:
+        if len(defn) == 1:
+            # Section header row
+            _section_row(ws7, ri, defn[0], NCOLS7)
+            ri += 1
+            continue
+
+        etl_file, etl_col, phase, src_file, src_logic, cov_fn, notes = defn
+        bg = row_colors[ri % 2]
+
+        # Compute coverage
+        if cov_fn is None:
+            count_s = "Phase 2 / N/A" if phase == 2 else "Static / N/A"
+            pct_s   = "—"
+            sample  = "—"
+        else:
+            cnt, pct_s, sample = _cov(cov_fn)
+            count_s = f"{cnt:,} / {n_total:,}"
+
+        phase_s = "1" if phase == 1 else "2"
+        vals = [etl_file, etl_col, phase_s, src_file, src_logic, count_s, pct_s, sample, notes]
+        for ci, v in enumerate(vals, 1):
+            bgt = bg
+            if ci == 3:   # Phase col — colour-code
+                bgt = LIGHT_BLUE if phase == 1 else LIGHT_PURP
+            elif ci == 7 and pct_s not in ("—","Phase 2 / N/A","Static / N/A"):
+                try:
+                    pct_num = float(pct_s.strip("%"))
+                    bgt = LIGHT_GREEN if pct_num >= 90 else (YELLOW if pct_num >= 60 else LIGHT_RED)
+                except ValueError:
+                    pass
+            _data_cell(ws7, ri, ci, v, bg=bgt,
+                       bold=(ci == 2),
+                       center=(ci in (3, 6, 7)),
+                       colour=PURPLE if ci == 3 and phase == 2 else DARK_BLUE if ci == 3 else "000000")
+        ws7.row_dimensions[ri].height = 28
+        ri += 1
+
+    _set_widths(ws7, [38, 32, 6, 30, 54, 16, 11, 26, 36])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 8 — LEASE CHARGES (actual per-tenant rows from rent roll)
+    # ══════════════════════════════════════════════════════════════════════════
+    ws8 = wb.create_sheet("Lease Charges")
+    ws8.sheet_view.showGridLines = False
+    ws8.sheet_properties.tabColor = "C65911"
+
+    HDR8 = ["Unit", "Tenant Name", "Status", "Floor Plan",
+            "OneSite Column", "Yardi Code", "Amount ($)", "Lease From"]
+    NCOLS8 = len(HDR8)
+    _title_row(ws8, f"RPM Living  ·  Lease Charges — Actual Data  ·  {mappings.get('prop_name','')}  ·  #{property_code}",
+               NCOLS8, row=1)
+    _header_row(ws8, 2, HDR8)
+    ws8.freeze_panes = "A3"
+
+    STATUS_COLOUR8 = {0: LIGHT_BLUE, 4: LIGHT_ORG, 6: LIGHT_GREEN, 10: LIGHT_RED, 5: LIGHT_PURP}
+    STATUS_LABEL8  = {0:"Current",4:"Notice",6:"Future",10:"Eviction",5:"Former/Bal"}
+
+    ri = 3
+    if rr is not None:
+        resh_to_t = {t["resh_id"]: t for t in tenants.values()}
+        charge_cols = [c for c in CHARGE_CODE_MAP if c in rr.columns]
+        for _, rr_row in rr.iterrows():
+            rid = rr_row.get("resh_id")
+            t   = resh_to_t.get(rid)
+            if not t: continue
+            for col in charge_cols:
+                amt = rr_row.get(col, 0)
+                if pd.isna(amt) or float(amt) == 0: continue
+                bg = STATUS_COLOUR8.get(t["status"], WHITE)
+                row_vals = [
+                    t["unit_code"],
+                    f"{t['last_name']}, {t['first_name']}",
+                    STATUS_LABEL8.get(t["status"], "?"),
+                    t.get("floorplan", ""),
+                    col,
+                    CHARGE_CODE_MAP[col],
+                    float(amt),
+                    t.get("lease_from", ""),
+                ]
+                for ci, v in enumerate(row_vals, 1):
+                    _data_cell(ws8, ri, ci, v, bg=bg,
+                               bold=(ci == 1),
+                               center=(ci in (7,)))
+                ws8.row_dimensions[ri].height = 18
+                ri += 1
+    else:
+        ws8.merge_cells(f"A3:{get_column_letter(NCOLS8)}3")
+        c = ws8.cell(3, 1, "Rent roll data not available — re-run conversion to populate this tab.")
+        c.font = _df(italic=True, colour="595959")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws8.auto_filter.ref = f"A2:{get_column_letter(NCOLS8)}2"
+    _set_widths(ws8, [8, 24, 12, 14, 16, 13, 12, 12])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 9 — RENTABLE ITEMS (actual item records)
+    # ══════════════════════════════════════════════════════════════════════════
+    ws9 = wb.create_sheet("Rentable Items")
+    ws9.sheet_view.showGridLines = False
+    ws9.sheet_properties.tabColor = "7030A0"
+
+    HDR9 = ["Item Name", "Item Number", "Type Code", "Status",
+            "Unit Assigned", "Begin Date", "Amount ($)", "Tenant Name"]
+    NCOLS9 = len(HDR9)
+    _title_row(ws9, f"RPM Living  ·  Rentable Items — Actual Data  ·  {mappings.get('prop_name','')}  ·  #{property_code}",
+               NCOLS9, row=1)
+    _header_row(ws9, 2, HDR9)
+    ws9.freeze_panes = "A3"
+
+    STATUS_COLOUR9 = {
+        "In Use": LIGHT_BLUE, "Leased": LIGHT_BLUE, "NTV": LIGHT_ORG,
+        "Unassigned": LIGHT_GREEN, "Available": LIGHT_GREEN,
+    }
+
+    ri = 3
+    if rent_items is not None and not rent_items.empty:
+        unit_to_t = {t["unit_code"]: t for t in tenants.values()}
+        type_name = mappings["rentable_types"][0]["type_name"] if mappings["rentable_types"] else "Garage"
+        for _, row in rent_items.sort_values("item_number").iterrows():
+            bg = STATUS_COLOUR9.get(str(row.get("status","")), WHITE)
+            t  = unit_to_t.get(row.get("unit_code"))
+            tenant_name = f"{t['last_name']}, {t['first_name']}" if t else "—"
+            row_vals = [
+                row.get("item_name", ""),
+                row.get("item_number", ""),
+                type_name,
+                row.get("status", ""),
+                row.get("unit_code", ""),
+                row.get("begin_date", ""),
+                float(row.get("amount", 0)) if row.get("amount") else 0.0,
+                tenant_name,
+            ]
+            for ci, v in enumerate(row_vals, 1):
+                _data_cell(ws9, ri, ci, v, bg=bg,
+                           bold=(ci == 1),
+                           center=(ci in (2, 7)))
+            ws9.row_dimensions[ri].height = 18
+            ri += 1
+    else:
+        ws9.merge_cells(f"A3:{get_column_letter(NCOLS9)}3")
+        c = ws9.cell(3, 1, "Rentable items data not available — re-run conversion to populate this tab.")
+        c.font = _df(italic=True, colour="595959")
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws9.auto_filter.ref = f"A2:{get_column_letter(NCOLS9)}2"
+    _set_widths(ws9, [22, 12, 16, 14, 14, 13, 12, 24])
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 10 — TAKEOVER GUIDE REFERENCE (actual values from this property)
+    # ══════════════════════════════════════════════════════════════════════════
+    ws10 = wb.create_sheet("Takeover Guide Ref")
+    ws10.sheet_view.showGridLines = False
+    ws10.sheet_properties.tabColor = "843C0C"
+
+    NCOLS10 = 7
+    _title_row(ws10,
+               f"RPM Living  ·  Takeover Guide Reference  ·  {mappings.get('prop_name','')}  ·  #{property_code}",
+               NCOLS10, row=1)
+    ws10.row_dimensions[1].height = 26
+
+    ri = 2
+
+    # ── Property Info ─────────────────────────────────────────────────────────
+    _section_row(ws10, ri, "PROPERTY INFO", NCOLS10, bg=TEAL); ri += 1
+    _header_row(ws10, ri, ["Field", "Value", "", "", "", "", ""], bg=DARK_BLUE); ri += 1
+    prop_info = [
+        ("Property Name",    mappings.get("prop_name", "")),
+        ("Property Code",    property_code),
+        ("Street Address",   mappings.get("address", "")),
+        ("City",             mappings.get("city", "")),
+        ("State",            mappings.get("state", "")),
+        ("Zip",              mappings.get("zipcode", "")),
+        ("Property Prefix",  mappings.get("prop_prefix", "")),
+    ]
+    for label, val in prop_info:
+        bg = LIGHT_BLUE if ri % 2 == 0 else WHITE
+        _data_cell(ws10, ri, 1, label, bg=bg, bold=True)
+        _data_cell(ws10, ri, 2, str(val), bg=bg)
+        for ci in range(3, NCOLS10 + 1):
+            _data_cell(ws10, ri, ci, "", bg=bg)
+        ws10.row_dimensions[ri].height = 18
+        ri += 1
+
+    ri += 1  # blank gap
+
+    # ── Unit Types ────────────────────────────────────────────────────────────
+    _section_row(ws10, ri, f"UNIT TYPE MAPPINGS  ({len(mappings['unit_type_map'])} types)", NCOLS10, bg=TEAL); ri += 1
+    _header_row(ws10, ri, ["OneSite Floor Plan", "Yardi Code", "Description",
+                             "Beds", "Baths", "SQFT", "Market Rent ($)"], bg=DARK_BLUE); ri += 1
+    for prior, ut in sorted(mappings["unit_type_map"].items()):
+        bg = LIGHT_BLUE if ri % 2 == 0 else WHITE
+        vals10u = [prior, ut["yardi_code"], ut.get("desc",""),
+                   ut["beds"], ut["baths"], ut["sqft"], ut["rent"]]
+        for ci, v in enumerate(vals10u, 1):
+            _data_cell(ws10, ri, ci, v, bg=bg,
+                       bold=(ci == 1), center=(ci in (4,5,6,7)))
+        ws10.row_dimensions[ri].height = 18
+        ri += 1
+
+    ri += 1
+
+    # ── Amenities ─────────────────────────────────────────────────────────────
+    _section_row(ws10, ri, f"AMENITY MAPPINGS  ({len(mappings['amenity_map'])} amenities)", NCOLS10, bg=TEAL); ri += 1
+    _header_row(ws10, ri, ["OneSite Amenity Name", "RPM Description", "Yardi Code",
+                             "Monthly Amount ($)", "", "", ""], bg=DARK_BLUE); ri += 1
+    for prior, (desc, code, amt) in sorted(mappings["amenity_map"].items()):
+        bg = LIGHT_BLUE if ri % 2 == 0 else WHITE
+        vals10a = [prior, desc, code, amt, "", "", ""]
+        for ci, v in enumerate(vals10a, 1):
+            _data_cell(ws10, ri, ci, v, bg=bg,
+                       bold=(ci == 1), center=(ci == 4))
+        ws10.row_dimensions[ri].height = 18
+        ri += 1
+
+    ri += 1
+
+    # ── Rentable Item Types ───────────────────────────────────────────────────
+    rt_list = mappings.get("rentable_types", [])
+    _section_row(ws10, ri, f"RENTABLE ITEM TYPES  ({len(rt_list)} types)", NCOLS10, bg=TEAL); ri += 1
+    _header_row(ws10, ri, ["OneSite Name", "Yardi Type Name", "Charge Code",
+                             "Market Rent ($)", "", "", ""], bg=DARK_BLUE); ri += 1
+    for rt in rt_list:
+        bg = LIGHT_BLUE if ri % 2 == 0 else WHITE
+        vals10r = [rt["prior_name"], rt["type_name"], rt["charge_code"], rt["rent"], "", "", ""]
+        for ci, v in enumerate(vals10r, 1):
+            _data_cell(ws10, ri, ci, v, bg=bg,
+                       bold=(ci == 1), center=(ci == 4))
+        ws10.row_dimensions[ri].height = 18
+        ri += 1
+
+    ws10.freeze_panes = "A2"
+    _set_widths(ws10, [30, 22, 24, 14, 12, 10, 16])
+
+
+def build_validation_workbook(vdata, mappings, property_code, tenants, output_path,
+                               rr=None, rent_items=None):
     """
     Build a multi-sheet Excel validation workbook.
     Sheets:
-      1. Summary       — counts by status, quality flags, property info
-      2. Tenants        — full roster (all statuses, all columns)
-      3. Quality Flags  — tenants missing email / phone / lease sign date
-      4. Unit Types     — floor plan → Yardi code mapping
-      5. Amenities      — amenity code + monthly charge mapping
-      6. Charge Codes   — OneSite column → Yardi transaction code mapping
+      1. Summary          — counts by status, quality flags, property info
+      2. Tenants          — full roster (all statuses, all columns)
+      3. Quality Flags    — tenants missing email / phone / lease sign date
+      4. Unit Types       — floor plan → Yardi code mapping
+      5. Amenities        — amenity code + monthly charge mapping
+      6. Charge Codes     — OneSite column → Yardi transaction code mapping
+      7. Field Mapping    — source → ETL field map with actual coverage stats & sample values
+      8. Lease Charges    — actual per-tenant charge rows from the rent roll
+      9. Rentable Items   — individual rentable item records with unit assignment
+     10. Takeover Guide   — formatted dump of every mapping read from the Takeover Guide
+    rr:          rent roll DataFrame (optional — enables Sheet 8 data)
+    rent_items:  rentable items DataFrame (optional — enables Sheet 9 data)
     """
     from openpyxl import Workbook
     from openpyxl.styles import (Font, PatternFill, Alignment,
@@ -1561,6 +2222,9 @@ def build_validation_workbook(vdata, mappings, property_code, tenants, output_pa
         write_data_row(ws6, ri, [r[k] for k in hdrs6], bg=bg)
     set_col_widths(ws6, [18,13,13,16,12])
     ws6.freeze_panes = "A2"
+
+    # ── Mapping tabs (7–10) ─────────────────────────────────────────────────
+    _add_mapping_tabs(wb, vdata, mappings, tenants, rr=rr, rent_items=rent_items)
 
     # ── Finish ────────────────────────────────────────────────────────────────
     # Set Summary as the active sheet on open
