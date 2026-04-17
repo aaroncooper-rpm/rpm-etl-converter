@@ -1299,7 +1299,7 @@ def run_phase2(base, output_dir, mappings, property_code,
 
 # ─────────────────── VALIDATION WORKBOOK ─────────────────────────────────────
 
-def _add_mapping_tabs(wb, vdata, mappings, tenants, rr=None, rent_items=None):
+def _add_mapping_tabs(wb, vdata, mappings, tenants, property_code="", rr=None, rent_items=None):
     """
     Add runtime data-mapping reference tabs to an existing openpyxl Workbook.
 
@@ -2224,7 +2224,7 @@ def build_validation_workbook(vdata, mappings, property_code, tenants, output_pa
     ws6.freeze_panes = "A2"
 
     # ── Mapping tabs (7–10) ─────────────────────────────────────────────────
-    _add_mapping_tabs(wb, vdata, mappings, tenants, rr=rr, rent_items=rent_items)
+    _add_mapping_tabs(wb, vdata, mappings, tenants, property_code=property_code, rr=rr, rent_items=rent_items)
 
     # ── Finish ────────────────────────────────────────────────────────────────
     # Set Summary as the active sheet on open

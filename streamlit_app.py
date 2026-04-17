@@ -8,36 +8,6 @@ import pandas as pd
 import tempfile, os, zipfile, shutil, re
 from io import BytesIO
 
-
-def _extract_source_files(uploaded_items):
-    """
-    Accept any mix of upload types for the OneSite source files:
-      - .xls / .xlsx  → passed through as-is
-      - .zip          → extracted; only .xls / .xlsx entries are kept
-                        (macOS __MACOSX metadata and hidden files are skipped)
-    Returns a list of file-like objects each with a .name attribute,
-    ready to be written to the temp directory.
-    """
-    result = []
-    for item in uploaded_items:
-        if item.name.lower().endswith(".zip"):
-            try:
-                zf = zipfile.ZipFile(BytesIO(item.read()))
-                for entry in zf.namelist():
-                    # Skip macOS metadata folders and hidden/system files
-                    if "__MACOSX" in entry or "/." in entry or entry.startswith("."):
-                        continue
-                    if not entry.lower().endswith((".xls", ".xlsx")):
-                        continue
-                    buf = BytesIO(zf.read(entry))
-                    buf.name = entry.split("/")[-1]  # bare filename, strip any subfolder path
-                    result.append(buf)
-            except zipfile.BadZipFile:
-                st.warning(f"⚠️ '{item.name}' could not be opened as a ZIP file and was skipped.")
-        else:
-            result.append(item)
-    return result
-
 st.set_page_config(
     page_title="RPM Living · ETL Converter",
     page_icon="🏢",
@@ -316,22 +286,15 @@ if st.session_state.step == 1:
         )
     with col2:
         st.markdown("**📂 OneSite Export Files**")
-        st.caption("Upload individual Excel files, a ZIP archive, a zipped folder, or any mix — no naming convention required")
-        src_uploads = st.file_uploader(
-            "OneSite Reports", type=["xls","xlsx","zip"],
+        st.caption("Select all OneSite report files at once — any format, any filename")
+        src_files = st.file_uploader(
+            "OneSite Reports", type=["xls","xlsx"],
             key="src_files", label_visibility="collapsed",
             accept_multiple_files=True
         )
 
-    src_files = _extract_source_files(src_uploads) if src_uploads else []
-
     if rpm_file and src_files:
-        zip_count = sum(1 for u in (src_uploads or []) if u.name.lower().endswith(".zip"))
-        xl_count  = len(src_files)
-        if zip_count:
-            st.caption(f"✅ {xl_count} Excel file(s) ready ({zip_count} extracted from ZIP)")
-        else:
-            st.caption(f"✅ {xl_count} source file(s) selected")
+        st.caption(f"✅ {len(src_files)} source file(s) selected")
         st.markdown("---")
         col_pc, col_bal = st.columns([1, 2])
         with col_pc:
@@ -397,10 +360,10 @@ if st.session_state.step == 1:
                         import traceback
                         st.error(f"❌ {e}"); st.code(traceback.format_exc())
 
-    elif not rpm_file and src_uploads:
+    elif not rpm_file and src_files:
         st.warning("⚠️ Please also upload the RPM Takeover Guide — it contains all unit type, amenity, and property mappings.")
     elif rpm_file and not src_files:
-        st.info("ℹ️ Upload the OneSite export files to continue. You can upload individual Excel files, a ZIP archive, or both.")
+        st.info("ℹ️ Upload the OneSite export files to continue.")
 
     # Workflow explainer
     st.markdown("---")
